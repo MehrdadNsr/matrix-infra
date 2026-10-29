@@ -1,7 +1,7 @@
 # Retries creating the free Oracle Cloud A1 server "matrix-bridge" every 5 minutes until Toronto has capacity.
 # Never makes a second server: if matrix-bridge exists (any state but TERMINATED), it only disables itself.
-# Needs repo secrets OCI_KEY (API private key, PEM) and SSH_PUBLIC_KEY, and repo variables
-# OCI_USER, OCI_FINGERPRINT, OCI_TENANCY, OCI_REGION.
+# Needs repo secrets OCI_KEY (API private key, PEM) and SSH_PUBLIC_KEY. The OCIDs below are identifiers,
+# not secrets (Mehrdad, 2026-10-29: keep them in the file instead of repo variables).
 name: oci-retry
 
 on:
@@ -23,7 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      T: ${{ vars.OCI_TENANCY }}
+      OCI_USER: ocid1.user.oc1..aaaaaaaas4u4frssq6x7jj7xu7bogxoyfae2nh7pfk7s6awdyrxk7xzqvfvq
+      OCI_FINGERPRINT: "12:49:01:1d:74:23:e1:3f:fb:c7:52:a5:f0:e5:70:7c"
+      OCI_REGION: ca-toronto-1
+      T: ocid1.tenancy.oc1..aaaaaaaaoj3plf7cq3jbpu7acla742h2q7lxg65udimfhrq3xusz6bxxpnyq
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
@@ -43,7 +46,7 @@ jobs:
         run: |
           set -eu
           if [ -z "$OCI_KEY" ] || [ -z "$SSH_PUBLIC_KEY" ] || [ -z "$T" ]; then
-            echo "Missing OCI_KEY / SSH_PUBLIC_KEY secret or OCI_* variables."; exit 1
+            echo "Missing OCI_KEY / SSH_PUBLIC_KEY secret ."; exit 1
           fi
           mkdir -p ~/.oci
           printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
@@ -51,10 +54,10 @@ jobs:
           printf '%s\n' "$SSH_PUBLIC_KEY" > ~/.oci/ssh.pub
           cat > ~/.oci/config <<CFG
           [DEFAULT]
-          user=${{ vars.OCI_USER }}
-          fingerprint=${{ vars.OCI_FINGERPRINT }}
-          tenancy=${{ vars.OCI_TENANCY }}
-          region=${{ vars.OCI_REGION }}
+          user=$OCI_USER
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$T
+          region=$OCI_REGION
           key_file=$HOME/.oci/key.pem
           CFG
           sed -i 's/^ *//' ~/.oci/config
