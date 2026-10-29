@@ -6,7 +6,7 @@ name: oci-retry
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # Oracle answers 429 if asked more often; do not lower.
+    - cron: "*/30 * * * *"   # every 30 min: only ~100 free Actions minutes left this month (2026-10-29). Never below 5 (Oracle 429).
   workflow_dispatch:
 
 permissions:
