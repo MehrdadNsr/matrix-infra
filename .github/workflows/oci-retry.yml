@@ -30,24 +30,37 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      - name: Secrets set?
+        id: cfg
+        env:
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          if [ -z "$OCI_KEY" ] || [ -z "$SSH_PUBLIC_KEY" ]; then
+            echo "::warning::Secrets OCI_KEY / SSH_PUBLIC_KEY not set yet; skipping this run."
+            echo "ready=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=1" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Cache OCI CLI
+        if: steps.cfg.outputs.ready == '1'
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: oci-cli-pip-v1
 
       - name: Install OCI CLI
+        if: steps.cfg.outputs.ready == '1'
         run: pip install --quiet oci-cli
 
       - name: Write OCI config (key never printed)
+        if: steps.cfg.outputs.ready == '1'
         env:
           OCI_KEY: ${{ secrets.OCI_KEY }}
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set -eu
-          if [ -z "$OCI_KEY" ] || [ -z "$SSH_PUBLIC_KEY" ] || [ -z "$T" ]; then
-            echo "Missing OCI_KEY / SSH_PUBLIC_KEY secret ."; exit 1
-          fi
           mkdir -p ~/.oci
           printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
           chmod 600 ~/.oci/key.pem
@@ -65,6 +78,7 @@ jobs:
           oci setup repair-file-permissions --file ~/.oci/config >/dev/null 2>&1 || true
 
       - name: Stop if matrix-bridge already exists
+        if: steps.cfg.outputs.ready == '1'
         id: exists
         run: |
           set -eu
@@ -79,7 +93,7 @@ jobs:
           fi
 
       - name: Launch matrix-bridge
-        if: steps.exists.outputs.found != '1'
+        if: steps.cfg.outputs.ready == '1' && steps.exists.outputs.found != '1'
         id: launch
         run: |
           set -u
