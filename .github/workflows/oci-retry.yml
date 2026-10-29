@@ -1,0 +1,128 @@
+# Retries creating the free Oracle Cloud A1 server "matrix-bridge" every 5 minutes until Toronto has capacity.
+# Never makes a second server: if matrix-bridge exists (any state but TERMINATED), it only disables itself.
+# Needs repo secrets OCI_KEY (API private key, PEM) and SSH_PUBLIC_KEY, and repo variables
+# OCI_USER, OCI_FINGERPRINT, OCI_TENANCY, OCI_REGION.
+name: oci-retry
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # Oracle answers 429 if asked more often; do not lower.
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  issues: write
+  contents: read
+
+concurrency:
+  group: oci-retry
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      T: ${{ vars.OCI_TENANCY }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Cache OCI CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: oci-cli-pip-v1
+
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Write OCI config (key never printed)
+        env:
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -eu
+          if [ -z "$OCI_KEY" ] || [ -z "$SSH_PUBLIC_KEY" ] || [ -z "$T" ]; then
+            echo "Missing OCI_KEY / SSH_PUBLIC_KEY secret or OCI_* variables."; exit 1
+          fi
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          printf '%s\n' "$SSH_PUBLIC_KEY" > ~/.oci/ssh.pub
+          cat > ~/.oci/config <<CFG
+          [DEFAULT]
+          user=${{ vars.OCI_USER }}
+          fingerprint=${{ vars.OCI_FINGERPRINT }}
+          tenancy=${{ vars.OCI_TENANCY }}
+          region=${{ vars.OCI_REGION }}
+          key_file=$HOME/.oci/key.pem
+          CFG
+          sed -i 's/^ *//' ~/.oci/config
+          chmod 600 ~/.oci/config
+          oci setup repair-file-permissions --file ~/.oci/config >/dev/null 2>&1 || true
+
+      - name: Stop if matrix-bridge already exists
+        id: exists
+        run: |
+          set -eu
+          n=$(oci compute instance list --compartment-id "$T" --display-name matrix-bridge --all \
+                --query 'length(data[?"lifecycle-state"!=`TERMINATED`])' --raw-output 2>/dev/null || echo error)
+          n=${n:-0}   # the CLI prints nothing when there are no instances
+          echo "existing matrix-bridge (not terminated): $n"
+          if [ "$n" = "error" ]; then echo "Could not list instances (check key/variables)."; exit 1; fi
+          if [ "$n" != "0" ]; then
+            gh workflow disable oci-retry.yml
+            echo "found=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Launch matrix-bridge
+        if: steps.exists.outputs.found != '1'
+        id: launch
+        run: |
+          set -u
+          AD=$(oci iam availability-domain list --compartment-id "$T" --query 'data[0].name' --raw-output)
+          IMG=$(oci compute image list --compartment-id "$T" --operating-system "Canonical Ubuntu" \
+                  --operating-system-version "24.04" --shape VM.Standard.A1.Flex \
+                  --sort-by TIMECREATED --sort-order DESC --limit 1 --query 'data[0].id' --raw-output)
+          VCN=$(oci network vcn list --compartment-id "$T" --display-name matrix-vcn --query 'data[0].id' --raw-output)
+          SUB=$(oci network subnet list --compartment-id "$T" --vcn-id "$VCN" \
+                  --display-name "public subnet-matrix-vcn" --query 'data[0].id' --raw-output)
+          for v in AD IMG VCN SUB; do
+            if [ -z "${!v}" ] || [ "${!v}" = "null" ]; then echo "Could not find $v."; exit 1; fi
+          done
+          echo "AD=$AD"
+          set +e
+          out=$(oci compute instance launch --compartment-id "$T" --availability-domain "$AD" \
+                  --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+                  --image-id "$IMG" --subnet-id "$SUB" --assign-public-ip true \
+                  --display-name matrix-bridge --ssh-authorized-keys-file ~/.oci/ssh.pub \
+                  --wait-for-state RUNNING --max-wait-seconds 600 \
+                  --query 'data.id' --raw-output 2>&1)
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            if echo "$out" | grep -qiE 'out of (host )?capacity|OutOfCapacity|TooManyRequests|"status": 429|\b429\b'; then
+              echo "No capacity / rate limited this time; will retry in 5 minutes."
+              exit 0
+            fi
+            echo "$out" | grep -viE 'key|fingerprint|BEGIN|END' | tail -20
+            exit 1
+          fi
+          ID=$(echo "$out" | grep -o 'ocid1\.instance[^" ]*' | tail -1)
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Report and stop retrying
+        if: steps.launch.outputs.id != ''
+        env:
+          ID: ${{ steps.launch.outputs.id }}
+        run: |
+          set -eu
+          IP=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output)
+          echo "matrix-bridge is RUNNING at $IP"
+          gh issue create --title "matrix-bridge ساخته شد" \
+            --body "سرور matrix-bridge ساخته شد و RUNNING است.
+
+          - Public IP: \`$IP\`
+          - Shape: VM.Standard.A1.Flex (2 OCPU, 12 GB), Ubuntu 24.04, ca-toronto-1
+          - Workflow oci-retry غیرفعال شد."
+          gh workflow disable oci-retry.yml
