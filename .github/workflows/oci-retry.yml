@@ -109,30 +109,43 @@ jobs:
             if [ -z "${!v}" ] || [ "${!v}" = "null" ]; then echo "Could not find $v."; exit 1; fi
           done
           echo "AD=$AD"
-          set +e
-          out=$(oci compute instance launch --compartment-id "$T" --availability-domain "$AD" \
-                  --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-                  --image-id "$IMG" --subnet-id "$SUB" --assign-public-ip true \
-                  --display-name matrix-bridge --ssh-authorized-keys-file ~/.oci/ssh.pub --no-retry \
-                  --wait-for-state RUNNING --max-wait-seconds 600 \
-                  --query 'data.id' --raw-output 2>&1)
-          rc=$?
-          set -e
-          if [ $rc -ne 0 ]; then
-            if echo "$out" | grep -qiE 'out of (host )?capacity|OutOfCapacity|TooManyRequests|"status": 429|\b429\b'; then
-              echo "No capacity / rate limited this time; will retry in 5 minutes."
+          # Big first; if Toronto has no room for it, the smaller one in the same run (it can be resized later).
+          # A 429 stops the run at once: asking again would only make Oracle slow us down more.
+          for size in '2 12' '1 6'; do
+            set -- $size
+            set +e
+            out=$(oci compute instance launch --compartment-id "$T" --availability-domain "$AD" \
+                    --shape VM.Standard.A1.Flex --shape-config "{\"ocpus\":$1,\"memoryInGBs\":$2}" \
+                    --image-id "$IMG" --subnet-id "$SUB" --assign-public-ip true \
+                    --display-name matrix-bridge --ssh-authorized-keys-file ~/.oci/ssh.pub --no-retry \
+                    --wait-for-state RUNNING --max-wait-seconds 600 \
+                    --query 'data.id' --raw-output 2>&1)
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              ID=$(echo "$out" | grep -o 'ocid1\.instance[^" ]*' | tail -1)
+              echo "id=$ID" >> "$GITHUB_OUTPUT"
+              echo "size=$1 OCPU, $2 GB" >> "$GITHUB_OUTPUT"
               exit 0
+            fi
+            if echo "$out" | grep -qiE 'TooManyRequests|"status": 429|\b429\b'; then
+              echo "Rate limited (429) at $1 OCPU / $2 GB; next scheduled run will retry."
+              exit 0
+            fi
+            if echo "$out" | grep -qiE 'out of (host )?capacity|OutOfCapacity'; then
+              echo "No capacity for $1 OCPU / $2 GB."
+              continue
             fi
             echo "$out" | grep -viE 'key|fingerprint|BEGIN|END' | tail -20
             exit 1
-          fi
-          ID=$(echo "$out" | grep -o 'ocid1\.instance[^" ]*' | tail -1)
-          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          done
+          echo "No capacity for either size; next scheduled run will retry."
 
       - name: Report and stop retrying
         if: steps.launch.outputs.id != ''
         env:
           ID: ${{ steps.launch.outputs.id }}
+          SIZE: ${{ steps.launch.outputs.size }}
         run: |
           set -eu
           IP=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output)
@@ -141,6 +154,6 @@ jobs:
             --body "سرور matrix-bridge ساخته شد و RUNNING است.
 
           - Public IP: \`$IP\`
-          - Shape: VM.Standard.A1.Flex (2 OCPU, 12 GB), Ubuntu 24.04, ca-toronto-1
+          - Shape: VM.Standard.A1.Flex ($SIZE), Ubuntu 24.04, ca-toronto-1
           - Workflow oci-retry غیرفعال شد."
           gh workflow disable oci-retry.yml
