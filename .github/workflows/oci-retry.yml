@@ -29,6 +29,7 @@ jobs:
       T: ocid1.tenancy.oc1..aaaaaaaaoj3plf7cq3jbpu7acla742h2q7lxg65udimfhrq3xusz6bxxpnyq
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      SUPPRESS_LABEL_WARNING: "True"
     steps:
       - name: Secrets set?
         id: cfg
@@ -112,7 +113,7 @@ jobs:
           out=$(oci compute instance launch --compartment-id "$T" --availability-domain "$AD" \
                   --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
                   --image-id "$IMG" --subnet-id "$SUB" --assign-public-ip true \
-                  --display-name matrix-bridge --ssh-authorized-keys-file ~/.oci/ssh.pub \
+                  --display-name matrix-bridge --ssh-authorized-keys-file ~/.oci/ssh.pub --no-retry \
                   --wait-for-state RUNNING --max-wait-seconds 600 \
                   --query 'data.id' --raw-output 2>&1)
           rc=$?
