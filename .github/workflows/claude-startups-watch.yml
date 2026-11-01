@@ -1,0 +1,74 @@
+# Watches the Claude for Startups page twice a day. When the visible text changes
+# (e.g. applications reopen), opens an Issue so Mehrdad gets an email.
+name: claude-startups-watch
+
+on:
+  schedule:
+    - cron: "17 */12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: claude-startups-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      URL: https://claude.com/programs/startups
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch page text
+        run: |
+          set -eu
+          mkdir -p watch
+          curl -sL -A "Mozilla/5.0" "$URL" -o page.html
+          python3 - <<'PY'
+          import re, html
+          s = open("page.html", encoding="utf-8", errors="ignore").read()
+          s = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", s)
+          s = re.sub(r"(?s)<[^>]+>", "\n", s)
+          lines = [html.unescape(l).strip() for l in s.splitlines()]
+          lines = [l for l in lines if len(l) > 2]
+          open("new.txt", "w").write("\n".join(lines) + "\n")
+          PY
+          wc -l new.txt
+      - name: Compare and report
+        run: |
+          set -eu
+          if [ ! -s new.txt ]; then echo "Empty page, skip."; exit 0; fi
+          kw=$(grep -iE "apply|application|paused|closed|waitlist|open" new.txt | head -15 || true)
+          if [ ! -f watch/claude-startups.txt ]; then
+            cp new.txt watch/claude-startups.txt
+            first=1
+          else
+            first=0
+          fi
+          if [ "$first" = "0" ] && cmp -s new.txt watch/claude-startups.txt; then
+            echo "No change."; exit 0
+          fi
+          d=$(diff watch/claude-startups.txt new.txt | head -60 || true)
+          cp new.txt watch/claude-startups.txt
+          git config user.name "watch-bot"
+          git config user.email "watch-bot@users.noreply.github.com"
+          git add watch/claude-startups.txt
+          git commit -m "claude-startups-watch: page snapshot" || true
+          git push
+          if [ "$first" = "1" ]; then echo "Baseline saved."; exit 0; fi
+          gh issue create --title "صفحه‌ی Claude for Startups تغییر کرد" --body "صفحه‌ی $URL عوض شده. شاید ثبت‌نام دوباره باز شده؛ چک کن.
+
+          خطوط کلیدی الان:
+          \`\`\`
+          $kw
+          \`\`\`
+
+          تغییرات:
+          \`\`\`
+          $d
+          \`\`\`"
