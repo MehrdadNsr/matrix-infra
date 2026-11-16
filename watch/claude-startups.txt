@@ -34,6 +34,7 @@ Developers
 Build with
 Claude Code
 Claude Platform
+Code Review
 Managed Agents
 For developers
 Claude Academy
@@ -216,6 +217,7 @@ Claude Duet
 Claude Tag
 Claude Science
 Claude Security
+Code Review
 Download app
 Pricing
 Log in
@@ -314,6 +316,7 @@ Claude Duet
 Claude Tag
 Claude Science
 Claude Security
+Code Review
 Download app
 Pricing
 Log in
