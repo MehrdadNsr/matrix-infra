@@ -1,0 +1,1 @@
+{"description":"Neon Bridge v2 — a Tampermonkey userscript that works through a queue of coding task cards on Gemini.","license":"MIT","name":"neon-bridge","private":true,"scripts":{"build":"node build.mjs","test":"node --test"},"type":"module","version":"0.1.0"}
