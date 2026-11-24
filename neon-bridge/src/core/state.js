@@ -173,5 +173,6 @@ export function createWorkerState() {
     quotaPct: null,
     blockedCount: 0, // cards waiting for an answer (status "blocked")
     latestQuestion: '', // text of the most recent routed question
+    lastAutoApproval: null, // e.g. "auto-approved read_file for neon-mcp"
   };
 }

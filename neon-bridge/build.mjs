@@ -25,6 +25,7 @@ const FILES = [
   'src/core/extract.js',
   'src/core/pacing.js',
   'src/core/message.js',
+  'src/core/permission.js',
   'src/core/state.js',
   'src/backend/client.js',
   'src/adapters/gemini.js',

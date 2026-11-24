@@ -9,6 +9,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   bridgeKey: '',
   workerId: '',
   gemUrl: '', // optional: when set, Gem mode is ON (default OFF)
+  mcpServerName: 'neon-mcp',
+  mcpToolNames: ['repo_info', 'list_dir', 'read_file', 'get_task', 'submit_file', 'ask_question', 'report_status'],
   quietHours: { start: '02:00', end: '08:00' },
   paceMinSec: 60,
   paceMaxSec: 180,
@@ -121,6 +123,8 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     ['bridgeKey', 'Bridge key', 'password'],
     ['workerId', 'Worker ID', 'text'],
     ['gemUrl', 'Gem URL (optional, Gem mode)', 'text'],
+    ['mcpServerName', 'MCP server name (auto-approve)', 'text'],
+    ['mcpToolNames', 'MCP tool names (comma-separated)', 'list'],
     ['paceMinSec', 'Pace min (sec)', 'number'],
     ['paceMaxSec', 'Pace max (sec)', 'number'],
     ['maxAttemptsPerCard', 'Max attempts / card', 'number'],
@@ -131,10 +135,15 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     const wrap = el('label', '', label);
     const input = el('input');
     input.id = `nb2-set-${key}`;
-    input.type = type;
-    input.value = String(settings[key] ?? '');
+    input.type = type === 'list' ? 'text' : type;
+    input.value = type === 'list' ? (settings[key] || []).join(', ') : String(settings[key] ?? '');
     input.addEventListener('change', () => {
-      const value = type === 'number' ? Number(input.value) : input.value;
+      const value =
+        type === 'number'
+          ? Number(input.value)
+          : type === 'list'
+            ? input.value.split(',').map((s) => s.trim()).filter(Boolean)
+            : input.value;
       settings[key] = value;
       store.set(`nb2-${key}`, value);
     });

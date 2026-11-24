@@ -99,6 +99,11 @@ export function loadSettings(store) {
     const saved = store.get(key, undefined);
     if (saved !== undefined) settings[key] = saved;
   }
+  // mcpToolNames is a list; an old stored string is split, not kept.
+  if (typeof settings.mcpToolNames === 'string') {
+    settings.mcpToolNames = settings.mcpToolNames.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  if (!Array.isArray(settings.mcpToolNames)) settings.mcpToolNames = [...DEFAULT_SETTINGS.mcpToolNames];
   return settings;
 }
 
@@ -211,6 +216,7 @@ export function start() {
         quotaPct: state.quotaPct,
         lastError: state.stoppedReason || null,
         version: NB2_VERSION,
+        lastAutoApproval: state.lastAutoApproval,
       });
     } catch (err) {
       log(`heartbeat failed: ${err.message}`);
@@ -244,6 +250,7 @@ export function start() {
   async function fullStop(kind, message) {
     state.running = false;
     state.stoppedReason = message;
+    permissionWatcher?.stop();
     persistState(store, state);
     if (panel) {
       panel.setState(`Stopped: ${message}`);
@@ -791,6 +798,41 @@ export function start() {
     panel.setCard(`#${state.pending.card.seq} ${state.pending.card.file_path} (resumed)`);
   }
   log(lock.held ? 'Neon Bridge v2 ready' : 'Neon Bridge v2 ready (idle: another tab holds the lock)');
+
+  // Permission-prompt watcher (neon-mcp auto-approve). It runs for
+  // the whole page session; approvals only happen while the worker
+  // runs, and an unknown prompt pauses the worker instead of ever
+  // clicking anything. See src/core/permission.js for the rule.
+  let permissionWatcher = null;
+  permissionWatcher = adapter.startPermissionWatcher({
+    getConfig: () => ({ serverName: settings.mcpServerName, toolNames: settings.mcpToolNames }),
+    isActive: () => state.running && lock.held,
+    onApproved: ({ tool, serverName }) => {
+      const label = `auto-approved ${tool || 'tool'} for ${serverName}`;
+      state.lastAutoApproval = label;
+      persistState(store, state);
+      sendHeartbeat('running'); // state change: approval to report
+    },
+    onUnknown: (promptText) => {
+      // Only the tab holding the worker acts on prompts; the idle
+      // tab never pauses or alerts for them.
+      if (!lock.held) return;
+      // Never click anything. Pause the worker, show it in the
+      // panel, and alert the owner (this alert is not gated on
+      // alertOnStop: it is the prompt-injection guard).
+      state.running = false;
+      persistState(store, state);
+      if (panel) {
+        panel.setRunning(false);
+        panel.setState(`Paused — unknown permission prompt: ${promptText.slice(0, 80)}`);
+      }
+      log(`unknown permission prompt, NOT approved: ${promptText}`);
+      client.notifyOwner('permission', promptText).catch((err) => {
+        log(`permission alert failed: ${err.message}`);
+      });
+      sendHeartbeat('paused');
+    },
+  });
 
   // Best-effort quota read when landing on the usage page.
   if (window.location.href.startsWith(GEMINI_USAGE_URL)) {

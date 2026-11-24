@@ -155,7 +155,7 @@ export class BackendClient {
    * Sent every 60 s and on every state change. A failed heartbeat
    * never stops the worker — the caller logs it and moves on.
    */
-  heartbeat({ worker, state, cardId, quotaPct, lastError, version }) {
+  heartbeat({ worker, state, cardId, quotaPct, lastError, version, lastAutoApproval }) {
     return this.call('heartbeat', {
       worker,
       state,
@@ -163,6 +163,7 @@ export class BackendClient {
       quota_pct: quotaPct == null ? null : quotaPct,
       last_error: lastError || null,
       version,
+      last_auto_approval: lastAutoApproval || null,
     });
   }
 
@@ -184,7 +185,11 @@ export class BackendClient {
     return res.id ? res : null;
   }
 
-  /** Owner notification — only called when the script fully stops. */
+  /**
+   * Owner notification. Kinds: "stopped" | "selectors" | "account"
+   * (full stops) and "permission" (an unknown permission prompt was
+   * found and left alone — the worker pauses instead of approving).
+   */
   notifyOwner(kind, message) {
     return this.call('alert', { kind, message });
   }

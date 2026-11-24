@@ -23,7 +23,8 @@
 
 import { SELECTORS, TEXT_MATCH } from '../selectors.js';
 import { classifyError } from '../core/errors.js';
-import { humanClickDelayMs, stepDelayMs } from '../core/pacing.js';
+import { humanClickDelayMs, randomMs, stepDelayMs } from '../core/pacing.js';
+import { classifyPermissionPrompt, matchPermissionButton, truncatePromptText } from '../core/permission.js';
 
 export const GEMINI_APP_URL = 'https://gemini.google.com/app';
 export const GEMINI_USAGE_URL = 'https://gemini.google.com/usage';
@@ -307,6 +308,91 @@ export class GeminiAdapter {
     btn.click();
     await waitMs(600);
     return firstMatch(SELECTORS.modelMenu) != null;
+  }
+
+  /**
+   * Permission-prompt watcher (MCP tool approval, neon-mcp only).
+   * `handlers`:
+   *  getConfig: () => ({ serverName, toolNames })
+   *  isActive: () => boolean — approvals only while the worker runs
+   *  onApproved: ({ tool, serverName, promptText }) => void
+   *  onUnknown: (promptText) => void — a prompt that does not belong
+   *    to our server: never clicked, handed to the caller to pause
+   *    the worker and alert the owner.
+   * Watches with a MutationObserver plus a 2 s fallback poll. Never
+   * clicks "Deny", and never approves anything outside
+   * gemini.google.com (guarded here as well as by the @match).
+   * Returns { stop }.
+   */
+  startPermissionWatcher(handlers) {
+    const noop = { stop() {} };
+    if (!window.location.hostname.endsWith('gemini.google.com')) return noop;
+    const seen = new WeakSet(); // prompt buttons already handled once
+    let stopped = false;
+    let lastScan = 0;
+
+    const scan = () => {
+      if (stopped) return;
+      // Throttle: the page mutates constantly while generating; the
+      // 2 s poll guarantees detection even when scans are skipped.
+      const now = Date.now();
+      if (now - lastScan < 500) return;
+      lastScan = now;
+      const patterns = TEXT_MATCH.permissionButtons;
+      const candidates = [...document.querySelectorAll('button')].filter((b) => {
+        if (!visible(b) || seen.has(b)) return false;
+        return matchPermissionButton(b.innerText || b.textContent, patterns) != null;
+      });
+      for (const button of candidates) {
+        const container =
+          button.closest(SELECTORS.permissionDialog.join(', ')) || button.parentElement;
+        if (!container) continue;
+        const promptText = (container.innerText || '').trim();
+        const kinds = [...container.querySelectorAll('button')]
+          .map((b) => matchPermissionButton(b.innerText || b.textContent, patterns))
+          .filter(Boolean);
+        if (!kinds.length) continue;
+        // Mark every button in this prompt as seen: one prompt is
+        // handled once, even if it re-renders or stays on screen.
+        for (const b of container.querySelectorAll('button')) seen.add(b);
+        const { serverName, toolNames } = handlers.getConfig();
+        const verdict = classifyPermissionPrompt({ text: promptText, buttons: kinds, serverName, toolNames });
+        if (verdict.decision === 'unknown') {
+          handlers.onUnknown(truncatePromptText(promptText));
+          continue;
+        }
+        if (!handlers.isActive()) continue; // approve only while running
+        // Ours: wait a human-like 400-1200 ms, then prefer
+        // "Always allow", else "Allow". Re-checked right before the
+        // click: a paused worker or a vanished prompt clicks nothing.
+        const targetKind = verdict.decision === 'approve-always' ? 'always' : 'allow';
+        const target =
+          [...container.querySelectorAll('button')].find(
+            (b) => matchPermissionButton(b.innerText || b.textContent, patterns) === targetKind,
+          ) || button;
+        const tool = verdict.tool || 'tool';
+        setTimeout(async () => {
+          if (stopped || !handlers.isActive()) return;
+          await waitMs(randomMs(400, 1200));
+          if (stopped || !handlers.isActive() || !target.isConnected) return;
+          target.click();
+          this.log(`auto-approved ${tool} for ${serverName}`);
+          handlers.onApproved({ tool: verdict.tool, serverName, promptText: truncatePromptText(promptText) });
+        }, 0);
+      }
+    };
+
+    const observer = new MutationObserver(() => scan());
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    const timer = setInterval(scan, 2000);
+    scan();
+    return {
+      stop() {
+        stopped = true;
+        observer.disconnect();
+        clearInterval(timer);
+      },
+    };
   }
 
   /** Close any open menu (Escape), best effort. */

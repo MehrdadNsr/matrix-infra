@@ -76,6 +76,9 @@ export const SELECTORS = {
 
   // Sign-in / captcha / unusual-traffic markers (checked by text too).
   signInLink: ['a[href*="accounts.google.com"]'],
+
+  // Permission-prompt dialogs (MCP tool approval). [unverified]
+  permissionDialog: ['[role="dialog"]', '[role="alertdialog"]'],
 };
 
 /** Text fragments the adapter may match on (model names only in English). */
@@ -85,6 +88,13 @@ export const TEXT_MATCH = {
   stopLabels: ['Stop', 'توقف'],
   signedOut: ['Sign in', 'ورود'],
   captcha: ['captcha', 'unusual traffic', 'ترافیک غیرمعمول'],
+  // Permission-prompt buttons. Exact (anchored) match only: "Allow
+  // all" or "Allow once" must never match. Persian: «اجازه دادن» =
+  // Allow, «همیشه اجازه داده شود» = Always allow.
+  permissionButtons: {
+    always: [/^always allow$/i, /^همیشه اجازه داده شود$/],
+    allow: [/^allow$/i, /^اجازه دادن$/],
+  },
 };
 
 /** Which selector keys still need a live-page check by the owner. */
@@ -106,4 +116,5 @@ export const SELECTOR_VERIFICATION = {
   thinkingOption: 'unverified',
   errorToast: 'unverified',
   signInLink: 'unverified',
+  permissionDialog: 'unverified',
 };
