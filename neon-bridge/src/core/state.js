@@ -174,5 +174,6 @@ export function createWorkerState() {
     blockedCount: 0, // cards waiting for an answer (status "blocked")
     latestQuestion: '', // text of the most recent routed question
     lastAutoApproval: null, // e.g. "auto-approved read_file for neon-mcp"
+    mcpHealth: { consecutiveFallbacks: 0, pasteUntil: 0 }, // MCP fallback streak + paste window (ms epoch)
   };
 }

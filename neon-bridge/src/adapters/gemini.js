@@ -49,6 +49,22 @@ function allMatches(selectors) {
   return out;
 }
 
+/**
+ * Matches of the FIRST selector that matches anything — no union.
+ * Use this for lists whose entries are NOT safe to union
+ * (modelMenuItem, thinkingOption): a generic fallback entry would
+ * mix rows from other menus into the list. allMatches() stays for
+ * lists where every entry is safe to union (stop button, busy
+ * indicators, user/model turns).
+ */
+function firstMatches(selectors, root = document) {
+  for (const sel of selectors) {
+    const found = [...root.querySelectorAll(sel)];
+    if (found.length) return found;
+  }
+  return [];
+}
+
 function visible(el) {
   if (!el) return false;
   const rect = el.getBoundingClientRect();
@@ -223,6 +239,20 @@ export class GeminiAdapter {
   /** Busy indicators: generation in progress even without a stop button. */
   busyIndicatorsPresent() {
     return allMatches(SELECTORS.busyIndicators).length > 0;
+  }
+
+  /**
+   * Non-blocking snapshot for the MCP poll: is anything generating
+   * right now, and what does the last model turn say (thinking
+   * removed)? Unlike waitForCompletion this returns immediately.
+   */
+  generationState() {
+    const answers = allMatches(SELECTORS.modelResponse);
+    const last = answers.length ? answers[answers.length - 1] : null;
+    return {
+      generating: this.stopButtonPresent() || this.busyIndicatorsPresent(),
+      lastModelText: last ? answerTextWithoutThinking(last).trim() : '',
+    };
   }
 
   /**
@@ -413,17 +443,18 @@ export class GeminiAdapter {
     const result = { modelSelectable: false, thinkingSelectable: false };
     try {
       if (!(await this.openModelMenu())) return result;
-      const items = allMatches(SELECTORS.modelMenuItem);
+      const items = firstMatches(SELECTORS.modelMenuItem);
       result.modelSelectable = items.some((el) =>
         Object.values(TEXT_MATCH.modelNames).some((name) => (el.innerText || '').includes(name)),
       );
-      const rows = [...(firstMatch(SELECTORS.modelMenu)?.querySelectorAll(SELECTORS.modelMenuItem.join(',')) || [])];
+      const menu = firstMatch(SELECTORS.modelMenu);
+      const rows = menu ? firstMatches(SELECTORS.modelMenuItem, menu) : [];
       const lastRow = rows[rows.length - 1];
       if (lastRow) {
         await this.humanPause();
         lastRow.click(); // opens the thinking submenu
         await waitMs(600);
-        result.thinkingSelectable = allMatches(SELECTORS.thinkingOption).filter(visible).length >= 3;
+        result.thinkingSelectable = firstMatches(SELECTORS.thinkingOption).filter(visible).length >= 3;
       }
       return result;
     } finally {
@@ -431,12 +462,12 @@ export class GeminiAdapter {
     }
   }
 
-  /** Pick a model by its English name ("Neon 4", "Hydrogen"). */
+  /** Pick a model by its English name ("Neon", "Hydrogen"). */
   async setModel(modelKey) {
     const want = TEXT_MATCH.modelNames[modelKey];
     if (!want) return false;
     if (!(await this.openModelMenu())) return false;
-    const items = allMatches(SELECTORS.modelMenuItem);
+    const items = firstMatches(SELECTORS.modelMenuItem);
     const item = items.find((el) => (el.innerText || '').includes(want));
     if (!item) return false;
     // "Carbon" is locked: never pick it, and never click a locked row.
@@ -450,6 +481,47 @@ export class GeminiAdapter {
   }
 
   /**
+   * Open the thinking submenu (last model-menu row) and return its
+   * visible options, or null when the menu does not open. Leaves the
+   * menu open; the caller closes it (or picks an option, which closes
+   * it on its own).
+   */
+  async openThinkingSubmenu() {
+    if (!(await this.openModelMenu())) return null;
+    const menu = firstMatch(SELECTORS.modelMenu);
+    if (!menu) return null;
+    const rows = firstMatches(SELECTORS.modelMenuItem, menu);
+    const lastRow = rows[rows.length - 1];
+    if (!lastRow) return null;
+    await this.humanPause();
+    lastRow.click(); // opens the thinking submenu
+    await waitMs(600);
+    return firstMatches(SELECTORS.thinkingOption).filter(visible);
+  }
+
+  /**
+   * Verify the thinking level by reopening the model menu and reading
+   * aria-checked on 'gem-menu[role="menu"] gem-menu-item[role=
+   * "menuitemradio"]' (index 0 low, 1 medium, 2 high), then closing
+   * the menu. The plain read-back cannot see the options once the
+   * menu closes, so this is the reliable check. Returns
+   * 'low' | 'medium' | 'high' | null (null = could not read).
+   */
+  async readThinkingViaMenu() {
+    let options = null;
+    try {
+      options = await this.openThinkingSubmenu();
+      if (!options) return null;
+      const checked = options.findIndex(
+        (o) => o.getAttribute('aria-checked') === 'true' || o.getAttribute('aria-selected') === 'true',
+      );
+      return checked >= 0 ? ['low', 'medium', 'high'][checked] : null;
+    } finally {
+      this.closeMenu();
+    }
+  }
+
+  /**
    * Pick a thinking level by index in the submenu the last menu row
    * opens: 0 = low, 1 = medium, 2 = high. Verifies the checkmark
    * (aria-checked / aria-selected / a check icon) afterwards.
@@ -457,16 +529,8 @@ export class GeminiAdapter {
   async setThinking(level) {
     const index = ['low', 'medium', 'high'].indexOf(level);
     if (index < 0) return false;
-    if (!(await this.openModelMenu())) return false;
-    const menu = firstMatch(SELECTORS.modelMenu);
-    if (!menu) return false;
-    const rows = [...menu.querySelectorAll(SELECTORS.modelMenuItem.join(','))];
-    const lastRow = rows[rows.length - 1];
-    if (!lastRow) return false;
-    await this.humanPause();
-    lastRow.click(); // opens the thinking submenu
-    await waitMs(600);
-    const options = allMatches(SELECTORS.thinkingOption).filter(visible);
+    const options = await this.openThinkingSubmenu();
+    if (!options) return false;
     const option = options[index];
     if (!option) return false;
     await this.humanPause();
@@ -477,7 +541,7 @@ export class GeminiAdapter {
 
   thinkingIsChecked(level) {
     const index = ['low', 'medium', 'high'].indexOf(level);
-    const options = allMatches(SELECTORS.thinkingOption).filter(visible);
+    const options = firstMatches(SELECTORS.thinkingOption).filter(visible);
     const option = options[index];
     if (!option) return false;
     if (option.getAttribute('aria-checked') === 'true') return true;
@@ -494,9 +558,11 @@ export class GeminiAdapter {
       if (label.includes(name)) model = key;
     }
     // Thinking level has no reliable always-visible label; report what
-    // the submenu shows when it can be read, otherwise null.
+    // the submenu shows when it can be read, otherwise null. (When the
+    // menu is closed there are no options in the DOM — use
+    // readThinkingViaMenu() for a reliable check.)
     let thinking = null;
-    const options = allMatches(SELECTORS.thinkingOption);
+    const options = firstMatches(SELECTORS.thinkingOption);
     const checked = options.findIndex(
       (o) => o.getAttribute('aria-checked') === 'true' || o.getAttribute('aria-selected') === 'true',
     );

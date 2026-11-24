@@ -11,6 +11,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
   gemUrl: '', // optional: when set, Gem mode is ON (default OFF)
   mcpServerName: 'neon-mcp',
   mcpToolNames: ['repo_info', 'list_dir', 'read_file', 'get_task', 'submit_file', 'ask_question', 'report_status'],
+  mode: 'auto', // "auto" | "mcp" | "paste": which mode runs a card
+  mcpPickupTimeoutSec: 90, // MCP: give up if no tool use seen in this long
+  mcpTaskTimeoutMin: 25, // MCP: give up if the task is not done in this long
   quietHours: { start: '02:00', end: '08:00' },
   paceMinSec: 60,
   paceMaxSec: 180,
@@ -90,6 +93,10 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
   quotaLine.id = 'nb2-quota';
   body.appendChild(quotaLine);
 
+  const modeLine = el('div', 'nb2-small', 'Mode: MCP');
+  modeLine.id = 'nb2-mode';
+  body.appendChild(modeLine);
+
   const blockedLine = el('div', 'nb2-small', 'Blocked (waiting for answer): 0');
   blockedLine.id = 'nb2-blocked';
   body.appendChild(blockedLine);
@@ -125,18 +132,32 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     ['gemUrl', 'Gem URL (optional, Gem mode)', 'text'],
     ['mcpServerName', 'MCP server name (auto-approve)', 'text'],
     ['mcpToolNames', 'MCP tool names (comma-separated)', 'list'],
+    ['mode', 'Mode (auto / mcp / paste)', 'select', ['auto', 'mcp', 'paste']],
+    ['mcpPickupTimeoutSec', 'MCP pickup timeout (sec)', 'number'],
+    ['mcpTaskTimeoutMin', 'MCP task timeout (min)', 'number'],
     ['paceMinSec', 'Pace min (sec)', 'number'],
     ['paceMaxSec', 'Pace max (sec)', 'number'],
     ['maxAttemptsPerCard', 'Max attempts / card', 'number'],
     ['dailySoftCap', 'Daily soft cap', 'number'],
   ];
   const inputs = {};
-  for (const [key, label, type] of fields) {
+  for (const [key, label, type, options] of fields) {
     const wrap = el('label', '', label);
-    const input = el('input');
+    let input;
+    if (type === 'select') {
+      input = el('select');
+      for (const opt of options) {
+        const o = el('option', '', opt);
+        o.value = opt;
+        input.appendChild(o);
+      }
+      input.value = settings[key];
+    } else {
+      input = el('input');
+      input.type = type === 'list' ? 'text' : type;
+      input.value = type === 'list' ? (settings[key] || []).join(', ') : String(settings[key] ?? '');
+    }
     input.id = `nb2-set-${key}`;
-    input.type = type === 'list' ? 'text' : type;
-    input.value = type === 'list' ? (settings[key] || []).join(', ') : String(settings[key] ?? '');
     input.addEventListener('change', () => {
       const value =
         type === 'number'
@@ -228,6 +249,9 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     },
     setCard(text) {
       cardLine.textContent = text;
+    },
+    setMode(text) {
+      modeLine.textContent = text;
     },
     setQuota(pct) {
       quotaLine.textContent = pct == null ? 'Quota: unknown' : `Quota remaining: ${pct}%`;

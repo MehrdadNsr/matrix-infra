@@ -13,6 +13,7 @@ export const ERROR_KINDS = Object.freeze([
   'signed_out',
   'captcha',
   'unusual_traffic',
+  'no_mcp_tools',
   'weekly_cap',
   'quota',
   'generic',
@@ -52,6 +53,28 @@ const PATTERNS = [
       /unusual\s+traffic/i,
       /ترافیک\s*غیر\s*معمول/,
       /ترافیک\s*غیر\s*عادی/,
+    ],
+  },
+  {
+    // Gemini says it has no tools / cannot reach neon-mcp. Checked
+    // before 'generic' and 'quota' so a "no tools, try again" reply
+    // is recognised as a no-tools reply, not a generic error.
+    kind: 'no_mcp_tools',
+    patterns: [
+      /no\s+(mcp\s+)?tools/i,
+      /don'?t\s+have\s+(access\s+to\s+)?(any\s+)?tools/i,
+      /do\s+not\s+have\s+(access\s+to\s+)?(any\s+)?tools/i,
+      /can'?t\s+access\s+(the\s+)?neon-mcp/i,
+      /cannot\s+access\s+(the\s+)?neon-mcp/i,
+      /no\s+access\s+to\s+(the\s+)?tools/i,
+      /tools?\s+(are\s+)?not\s+available/i,
+      /without\s+tools/i,
+      /not\s+supported/i,
+      /ابزار(ها)?\s*(را)?\s*ندارم/,
+      /به\s*ابزار(ها)?\s*دسترسی\s*ندارم/,
+      /در\s*دسترس\s*نیست/,
+      /پشتیبانی\s*نمی‌شود/,
+      /نمی‌توانم\s*به\s*neon-mcp\s*دسترسی/,
     ],
   },
   {

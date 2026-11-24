@@ -66,6 +66,35 @@ export function buildGemMessage(card, attempt = 1) {
   );
 }
 
+/**
+ * MCP-mode message. The first sentence rotates by attempt so a
+ * resend is never byte-identical; attempt 1 is the exact spec text.
+ * Gemini does the work through the neon-mcp tools and delivers the
+ * file with submit_file — it never pastes the file in the chat.
+ */
+export const MCP_INTROS = Object.freeze([
+  'Use the neon-mcp tools only.',
+  'Please work through the neon-mcp tools only.',
+  'For this task, use the neon-mcp tools only.',
+  'Work with the neon-mcp tools only.',
+]);
+
+export function mcpMessage(card, attempt = 1) {
+  const idx = ((attempt - 1) % MCP_INTROS.length + MCP_INTROS.length) % MCP_INTROS.length;
+  return (
+    `${MCP_INTROS[idx]} Call get_task with task_id=${card.id}. ` +
+    'Read the real files with read_file/list_dir, write the COMPLETE file, ' +
+    'and deliver it with submit_file. Never paste the file in the chat. ' +
+    'If something is unclear, call ask_question instead of guessing. ' +
+    `When submit_file succeeds, reply with the PR link and DONE-${card.id}.`
+  );
+}
+
+/** Sent once when Gemini's reply finished without submit_file. */
+export function mcpNudgeMessage(card) {
+  return `You did not finish with submit_file. Call submit_file now with task_id=${card.id} and the complete file.`;
+}
+
 /** Ask for the rest of a cut-off answer, in the same chat. */
 export function continueMessage(id) {
   return (

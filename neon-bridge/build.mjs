@@ -8,7 +8,7 @@
 // Usage: node build.mjs        (from the neon-bridge/ directory)
 //        node --test           (runs the unit tests in test/)
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,10 +26,13 @@ const FILES = [
   'src/core/pacing.js',
   'src/core/message.js',
   'src/core/permission.js',
+  'src/core/modes.js',
   'src/core/state.js',
   'src/backend/client.js',
   'src/adapters/gemini.js',
   'src/ui/panel.js',
+  'src/modes/paste.js',
+  'src/modes/mcp.js',
   'src/main.js',
 ];
 
@@ -113,6 +116,10 @@ function main() {
   mkdirSync(join(root, 'dist'), { recursive: true });
   writeFileSync(join(root, 'dist', 'neon-bridge.user.js'), dist, 'utf8');
   console.log(`built dist/neon-bridge.user.js (${dist.length} bytes, ${dist.split('\n').length} lines)`);
+  // The extension runs the same blob: copy it to extension/bridge.js
+  // on every build so the extension never drifts from dist.
+  copyFileSync(join(root, 'dist', 'neon-bridge.user.js'), join(root, 'extension', 'bridge.js'));
+  console.log('copied dist/neon-bridge.user.js -> extension/bridge.js');
 }
 
 main();
