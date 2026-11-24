@@ -124,6 +124,7 @@ test('verdictProblem: validates the supervisor payload', () => {
 test('createWorkerState: fresh state has no pending card', () => {
   const s = createWorkerState();
   assert.equal(s.running, false);
+  assert.deepEqual(s.mcpHealth, { consecutiveFallbacks: 0, pasteUntil: 0 });
   assert.equal(s.pending, null);
   assert.equal(s.sentToday, 0);
   assert.equal(s.blockedCount, 0);

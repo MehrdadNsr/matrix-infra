@@ -47,7 +47,9 @@ test('selectors: every key has a verification status', () => {
 });
 
 test('selectors: model names are English only', () => {
-  assert.deepEqual(TEXT_MATCH.modelNames, { neon: 'Neon 4', hydrogen: 'Hydrogen', carbon: 'Carbon' });
+  // 'Neon', not 'Neon 4': the Persian UI renders "4 Neon" (number first),
+  // so the name alone is matched (verified on the live page).
+  assert.deepEqual(TEXT_MATCH.modelNames, { neon: 'Neon', hydrogen: 'Hydrogen', carbon: 'Carbon' });
 });
 
 test('selectors: no hardcoded backend URL, account or repo name', () => {

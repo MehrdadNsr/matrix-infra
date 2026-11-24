@@ -99,6 +99,24 @@ test('classifyPermissionPrompt: no approve button at all -> unknown (safe defaul
   assert.equal(out.decision, 'unknown');
 });
 
+test('classifyPermissionPrompt: a prompt showing only a tool name is enough', () => {
+  // Known issue: Gemini's tool-approval prompt may not show the
+  // server name at all — a match on any of our tool names approves.
+  const out = classifyPermissionPrompt({
+    text: 'Allow read_file to access the repository? The tool wants to read a file.',
+    buttons: ['always', 'allow'], serverName: SERVER, toolNames: TOOLS,
+  });
+  assert.equal(out.decision, 'approve-always');
+  assert.equal(out.tool, 'read_file');
+  assert.equal(out.hasServerName, false);
+  const fa = classifyPermissionPrompt({
+    text: 'ابزار submit_file می‌خواهد فایل را ارسال کند. اجازه می‌دهید؟',
+    buttons: ['allow'], serverName: SERVER, toolNames: TOOLS,
+  });
+  assert.equal(fa.decision, 'approve');
+  assert.equal(fa.tool, 'submit_file');
+});
+
 test('detectToolName + truncatePromptText', () => {
   assert.equal(detectToolName('run submit_file please', TOOLS), 'submit_file');
   assert.equal(detectToolName('nothing here', TOOLS), null);

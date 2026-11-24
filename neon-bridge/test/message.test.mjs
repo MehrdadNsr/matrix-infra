@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { answerMessage, buildGemMessage, buildMessage, buildMessageWithLinks, continueMessage, introForAttempt, messageFooter } from '../src/core/message.js';
+import { answerMessage, buildGemMessage, buildMessage, buildMessageWithLinks, continueMessage, introForAttempt, mcpMessage, mcpNudgeMessage, messageFooter } from '../src/core/message.js';
 
 test('messageFooter: contains the CARD line, the END line and the rules', () => {
   const footer = messageFooter('42');
@@ -15,6 +15,37 @@ test('messageFooter: unclear task -> ask a QUESTION, do not guess', () => {
   assert.match(footer, /QUESTION 42/);
   assert.match(footer, /do NOT guess/);
   assert.match(footer, /contradicts the repo/);
+});
+
+test('mcpMessage: attempt 1 is the exact spec text', () => {
+  const card = { id: 'c9', prompt: 'do the thing' };
+  assert.equal(
+    mcpMessage(card, 1),
+    'Use the neon-mcp tools only. Call get_task with task_id=c9. ' +
+    'Read the real files with read_file/list_dir, write the COMPLETE file, ' +
+    'and deliver it with submit_file. Never paste the file in the chat. ' +
+    'If something is unclear, call ask_question instead of guessing. ' +
+    'When submit_file succeeds, reply with the PR link and DONE-c9.',
+  );
+});
+
+test('mcpMessage: first sentence rotates by attempt, never byte-identical', () => {
+  const card = { id: 'c9', prompt: 'do the thing' };
+  const first = mcpMessage(card, 1);
+  const second = mcpMessage(card, 2);
+  assert.notEqual(first, second);
+  assert.match(second, /task_id=c9/);
+  assert.match(second, /DONE-c9/);
+  assert.match(second, /submit_file/);
+  assert.match(second, /never paste the file/i);
+  assert.equal(mcpMessage(card, 5), first); // 4 intros, attempt 5 == attempt 1
+});
+
+test('mcpNudgeMessage: exact one-time nudge text', () => {
+  assert.equal(
+    mcpNudgeMessage({ id: 'c9' }),
+    'You did not finish with submit_file. Call submit_file now with task_id=c9 and the complete file.',
+  );
 });
 
 test('answerMessage: answers first, then continue with the same rules', () => {

@@ -16,6 +16,13 @@ const cases = [
   ['Our systems have detected unusual traffic from your computer network', 'unusual_traffic'],
   ["Couldn't send your message", 'send_failure'],
   ['The links were not read before answering', 'links_not_read'],
+  ["I don't have access to any tools", 'no_mcp_tools'],
+  ["I don't have tools in this chat", 'no_mcp_tools'],
+  ["I can't access the neon-mcp server", 'no_mcp_tools'],
+  ['This feature is NOT SUPPORTED', 'no_mcp_tools'],
+  ['The MCP tools are not available right now', 'no_mcp_tools'],
+  // Wins over 'generic': "try again" alone would be generic.
+  ["I don't have tools, please try again later", 'no_mcp_tools'],
   // Persian
   ['مشکلی پیش آمد، دوباره تلاش کنید', 'generic'],
   ['خطایی رخ داد', 'generic'],
@@ -26,6 +33,10 @@ const cases = [
   ['ترافیک غیرمعمول شناسایی شد', 'unusual_traffic'],
   ['پیام ارسال نشد', 'send_failure'],
   ['لینک‌ها خوانده نشد', 'links_not_read'],
+  ['به ابزار دسترسی ندارم', 'no_mcp_tools'],
+  ['ابزار ندارم', 'no_mcp_tools'],
+  ['ابزار در دسترس نیست', 'no_mcp_tools'],
+  ['این قابلیت پشتیبانی نمی‌شود', 'no_mcp_tools'],
 ];
 
 for (const [text, kind] of cases) {

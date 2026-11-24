@@ -56,8 +56,11 @@ Settings are stored with `GM_setValue`; nothing is hardcoded. See
    before the navigation and resumed on load.
 4. Health check: logged in, editor present, no captcha / sign-in /
    unusual-traffic page. Any failure stops the worker.
-5. Model + thinking are set, then **read back**. Mismatch → retry
-   once → card failed with "settings mismatch".
+5. Model + thinking are set, then **read back**. Thinking is verified
+   by reopening the model menu and reading `aria-checked` on the
+   thinking options (index 0 low, 1 medium, 2 high) — the plain
+   read-back cannot see the options once the menu closes. Mismatch →
+   retry once → card failed with "settings mismatch".
 6. The message is the card prompt plus a footer asking Gemini to start
    with `CARD <id>`, output exactly one file in one fenced block, and
    end with `END-<id>` (or `CONTINUE` if it must stop early).
@@ -74,6 +77,53 @@ Settings are stored with `GM_setValue`; nothing is hardcoded. See
     one thinking level up, new chat, resend; `fail` → card failed.
     `ask` is a first-class verdict, not an error — see below.
 11. Random pace before the next message.
+
+## Two modes per card: MCP first, paste as fallback
+
+Each card runs in one mode, chosen per card in `src/core/modes.js`
+(`mode` setting: `"auto"` | `"mcp"` | `"paste"`, default `"auto"`).
+
+**MCP mode (primary, `src/modes/mcp.js`).** Gemini itself works
+through the connected neon-mcp server: the script sends one message
+("Use the neon-mcp tools only. Call get_task with task_id=… … When
+submit_file succeeds, reply with the PR link and DONE-…") and then
+polls the backend every 10 s with action `card`. The card carries
+`mcp_seen_at` (non-null once the tools ran), `status` and
+`result_pr_url`:
+
+- `status` `"done"` → success: the PR link is shown in the panel, no
+  supervisor, no code extraction.
+- `status` `"blocked"` → a question was asked via MCP; the card is
+  counted as blocked and the worker moves on (same as chat ask).
+- `status` `"failed"` → logged with `last_error`, move on.
+- If Gemini's reply finished (stop button gone, text stable 8 s) but
+  the card is neither done nor blocked, the script sends **once**:
+  "You did not finish with submit_file. Call submit_file now…",
+  then keeps polling.
+
+It falls back to paste mode (same card, new chat, attempt + 1) when:
+`mcp_seen_at` is still null after `mcpPickupTimeoutSec` (default
+90 s); Gemini's reply says it has no tools / cannot reach neon-mcp /
+NOT SUPPORTED (patterns in `src/core/errors.js`, English + Persian);
+or `mcpTaskTimeoutMin` (default 25 min) passes without
+done/blocked/failed. The log says `MCP fallback: <reason>`.
+
+**MCP health.** After 2 consecutive fallbacks the worker uses paste
+mode for the next 30 minutes, then tries MCP again on the next card.
+A card that demonstrably used the tools (done, blocked, or a backend
+"failed" status) resets the streak. The panel shows the current mode
+(`MCP` / `PASTE` / `PASTE until hh:mm`) and the heartbeat state
+carries it (`running:mcp`, `running:paste`).
+
+`mode="mcp"` never falls back — a fallback fails the card instead.
+`mode="paste"` never tries MCP. Answered cards always run in paste
+mode: their answer is delivered as chat text.
+
+**Paste mode (`src/modes/paste.js`).** The original flow, moved here
+unchanged: send the prompt, wait, supervise, extract the code,
+submit. The permission watcher must be running in MCP mode (Always
+allow for neon-mcp tools only); a prompt that names neither our
+server nor any of our tools pauses the worker and alerts the owner.
 
 ## Questions and escalation
 
@@ -190,8 +240,12 @@ tool runs ("Allow" / "Always allow", or in Persian «اجازه دادن» /
   server or any of our tools (another app, Gmail, an unknown MCP
   server) pauses the worker, is shown in the panel, and triggers an
   owner alert `{kind:"permission", message:<prompt text, max 300
-  chars>}`. This is the guard against prompt injection making Gemini
-  call other tools.
+  chars>}` — the full prompt text (max 300 chars) goes in the panel
+  log and in the alert. This is the guard against prompt injection
+  making Gemini call other tools.
+- **Known issue:** Gemini's tool-approval prompt may not show the
+  server name at all, so a match on any of our tool names alone is
+  enough to approve.
 - "Deny" is never clicked automatically. Approvals only happen on
   gemini.google.com (guarded in the watcher as well as by the
   userscript `@match`) and only while the tab holding the worker is
@@ -245,13 +299,17 @@ neon-bridge/
     pacing.js             quiet hours, pace, backoff, quota guard
     message.js            prompt footer, continue message
     permission.js         permission-prompt classification (neon-mcp only)
+    modes.js              per-card mode choice + MCP health
     state.js              retry / escalation state machine
+  src/modes/mcp.js        MCP mode: tool message + backend poll
+  src/modes/paste.js      paste mode: send, supervise, extract, submit
   src/adapters/gemini.js  everything that touches the Gemini page
   src/backend/client.js   all HTTP calls (GM_xmlhttpRequest)
   src/ui/panel.js         floating control panel (nb2- prefixed)
   src/main.js             queue loop wiring it all together
   build.mjs               zero-dependency build (concatenates src/)
   dist/neon-bridge.user.js  committed build output — install this
+  extension/bridge.js     same blob as dist, for the Chrome extension
   test/*.test.mjs         node --test unit tests for core
   backend/README.md       backend API contract + deploy-your-own
   config.example.json     every setting with its default
@@ -269,9 +327,11 @@ never uses blocking dialogs — no `alert()`, `confirm()`, `prompt()`.
 ## Development
 
 ```bash
-node --test   # 72 unit tests (hash, extraction/stitching, errors en+fa,
-              # pacing/quiet-hours incl. overnight, state transitions)
-node build.mjs  # rebuilds dist/neon-bridge.user.js (committed)
+node --test   # 131 unit tests (hash, extraction/stitching, errors en+fa,
+              # pacing/quiet-hours incl. overnight, state transitions,
+              # mode choice + MCP health, MCP poll decisions, nudge-once)
+node build.mjs  # rebuilds dist/neon-bridge.user.js (committed) and
+                # copies it to extension/bridge.js
 ```
 
 The build fails if the output contains a blocking-dialog call, a
