@@ -170,6 +170,33 @@ Set `gemUrl` in the panel to a Gemini Gem URL to turn Gem mode on:
   fact and falls back to normal mode for that session (the saved
   `gemUrl` is left alone).
 
+## Auto-approve tool permission prompts (neon-mcp only)
+
+The Gemini app may show a permission prompt before a connected MCP
+tool runs ("Allow" / "Always allow", or in Persian «اجازه دادن» /
+«همیشه اجازه داده شود»). The watcher in `src/adapters/gemini.js`
+(MutationObserver + a 2 s fallback poll) handles it:
+
+- **Approve, only when the prompt is clearly ours:** the dialog or
+  inline card text must contain the configured MCP server name
+  (`mcpServerName`, default `neon-mcp`) **or** one of our tool names
+  (`mcpToolNames`, default: `repo_info`, `list_dir`, `read_file`,
+  `get_task`, `submit_file`, `ask_question`, `report_status`). Then
+  it waits a random 400–1200 ms and clicks "Always allow" if
+  present, otherwise "Allow". The approval is logged
+  ("auto-approved `<tool>` for neon-mcp") and sent in the next
+  heartbeat (`last_auto_approval`).
+- **Anything else: never click.** A prompt that does not name our
+  server or any of our tools (another app, Gmail, an unknown MCP
+  server) pauses the worker, is shown in the panel, and triggers an
+  owner alert `{kind:"permission", message:<prompt text, max 300
+  chars>}`. This is the guard against prompt injection making Gemini
+  call other tools.
+- "Deny" is never clicked automatically. Approvals only happen on
+  gemini.google.com (guarded in the watcher as well as by the
+  userscript `@match`) and only while the tab holding the worker is
+  running.
+
 ## Known fragility
 
 - **Gemini UI updates may break selectors.** That is what
@@ -217,6 +244,7 @@ neon-bridge/
     extract.js            code-block extraction, stitching, CARD/END
     pacing.js             quiet hours, pace, backoff, quota guard
     message.js            prompt footer, continue message
+    permission.js         permission-prompt classification (neon-mcp only)
     state.js              retry / escalation state machine
   src/adapters/gemini.js  everything that touches the Gemini page
   src/backend/client.js   all HTTP calls (GM_xmlhttpRequest)

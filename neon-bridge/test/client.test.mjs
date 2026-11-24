@@ -102,6 +102,7 @@ test('client: heartbeat sends worker, state, card, quota, version', async () => 
   });
   await client.heartbeat({
     worker: 'w1', state: 'running', cardId: 'c9', quotaPct: 42, lastError: null, version: '0.1.0',
+    lastAutoApproval: 'auto-approved read_file for neon-mcp',
   });
   assert.equal(calls[0].action, 'heartbeat');
   assert.equal(calls[0].worker, 'w1');
@@ -109,6 +110,7 @@ test('client: heartbeat sends worker, state, card, quota, version', async () => 
   assert.equal(calls[0].card_id, 'c9');
   assert.equal(calls[0].quota_pct, 42);
   assert.equal(calls[0].version, '0.1.0');
+  assert.equal(calls[0].last_auto_approval, 'auto-approved read_file for neon-mcp');
 });
 
 test('client: card() normalizes {card} and bare card; 404 means not provided', async () => {
