@@ -97,6 +97,9 @@ const SELECTORS = {
 
   // Sign-in / captcha / unusual-traffic markers (checked by text too).
   signInLink: ['a[href*="accounts.google.com"]'],
+
+  // Permission-prompt dialogs (MCP tool approval). [unverified]
+  permissionDialog: ['[role="dialog"]', '[role="alertdialog"]'],
 };
 
 /** Text fragments the adapter may match on (model names only in English). */
@@ -106,6 +109,13 @@ const TEXT_MATCH = {
   stopLabels: ['Stop', 'توقف'],
   signedOut: ['Sign in', 'ورود'],
   captcha: ['captcha', 'unusual traffic', 'ترافیک غیرمعمول'],
+  // Permission-prompt buttons. Exact (anchored) match only: "Allow
+  // all" or "Allow once" must never match. Persian: «اجازه دادن» =
+  // Allow, «همیشه اجازه داده شود» = Always allow.
+  permissionButtons: {
+    always: [/^always allow$/i, /^همیشه اجازه داده شود$/],
+    allow: [/^allow$/i, /^اجازه دادن$/],
+  },
 };
 
 /** Which selector keys still need a live-page check by the owner. */
@@ -127,6 +137,7 @@ const SELECTOR_VERIFICATION = {
   thinkingOption: 'unverified',
   errorToast: 'unverified',
   signInLink: 'unverified',
+  permissionDialog: 'unverified',
 };
 
 
@@ -747,6 +758,74 @@ function buildMessageWithLinks(card, linkedTexts, attempt = 1) {
 }
 
 
+// ---- src/core/permission.js ----
+// Permission-prompt classification — pure logic, no DOM.
+//
+// The adapter finds candidate Allow / Always allow buttons; this
+// module decides whether a prompt belongs to our MCP server. The
+// rule is deliberately narrow: approve ONLY when the prompt text
+// names our server or one of our tool names. Anything else is
+// "unknown" — never click it. This is the guard against prompt
+// injection making Gemini call other tools.
+//
+// Button label patterns live in selectors.js (TEXT_MATCH.
+// permissionButtons); they are passed in so this module stays
+// testable without the DOM.
+
+/** Prompt text sent to the owner is capped at this many characters. */
+const MAX_PROMPT_TEXT_CHARS = 300;
+
+/**
+ * Classify one button label: 'always' | 'allow' | null.
+ * `patterns` is TEXT_MATCH.permissionButtons ({ always: [...], allow: [...] }).
+ * Matching is exact (anchored) so "Allow all" or "Allow once" never match.
+ */
+function matchPermissionButton(label, patterns) {
+  const text = (label || '').trim();
+  if (!text) return null;
+  if (patterns.always.some((re) => re.test(text))) return 'always';
+  if (patterns.allow.some((re) => re.test(text))) return 'allow';
+  return null;
+}
+
+/** First of our tool names that appears in the prompt text, or null. */
+function detectToolName(text, toolNames) {
+  const hay = text || '';
+  for (const name of toolNames || []) {
+    if (name && hay.includes(name)) return name;
+  }
+  return null;
+}
+
+/**
+ * Decide what to do with a permission prompt.
+ * Input: { text, buttons, serverName, toolNames } where `buttons` is
+ * the list of classified button kinds present in the prompt
+ * ('always' / 'allow').
+ * Returns { decision, tool, hasServerName } where decision is:
+ *  - 'approve-always' — ours, and an "Always allow" button exists
+ *  - 'approve' — ours, only an "Allow" button exists
+ *  - 'unknown' — the prompt does not name our server or any of our
+ *    tools, or there is no approve button at all: never click.
+ */
+function classifyPermissionPrompt({ text, buttons, serverName, toolNames }) {
+  const hasServerName = Boolean(serverName) && (text || '').includes(serverName);
+  const tool = detectToolName(text, toolNames);
+  if (!hasServerName && !tool) {
+    return { decision: 'unknown', tool: null, hasServerName: false };
+  }
+  if ((buttons || []).includes('always')) return { decision: 'approve-always', tool, hasServerName };
+  if ((buttons || []).includes('allow')) return { decision: 'approve', tool, hasServerName };
+  return { decision: 'unknown', tool: null, hasServerName };
+}
+
+/** Collapse whitespace and cap prompt text for the owner alert. */
+function truncatePromptText(text, max = MAX_PROMPT_TEXT_CHARS) {
+  const t = (text || '').replace(/\s+/g, ' ').trim();
+  return t.length > max ? t.slice(0, max) : t;
+}
+
+
 // ---- src/core/state.js ----
 // State machine — pure logic, no DOM.
 // The queue loop asks these functions what to do next; it never
@@ -923,6 +1002,7 @@ function createWorkerState() {
     quotaPct: null,
     blockedCount: 0, // cards waiting for an answer (status "blocked")
     latestQuestion: '', // text of the most recent routed question
+    lastAutoApproval: null, // e.g. "auto-approved read_file for neon-mcp"
   };
 }
 
@@ -1084,7 +1164,7 @@ class BackendClient {
    * Sent every 60 s and on every state change. A failed heartbeat
    * never stops the worker — the caller logs it and moves on.
    */
-  heartbeat({ worker, state, cardId, quotaPct, lastError, version }) {
+  heartbeat({ worker, state, cardId, quotaPct, lastError, version, lastAutoApproval }) {
     return this.call('heartbeat', {
       worker,
       state,
@@ -1092,6 +1172,7 @@ class BackendClient {
       quota_pct: quotaPct == null ? null : quotaPct,
       last_error: lastError || null,
       version,
+      last_auto_approval: lastAutoApproval || null,
     });
   }
 
@@ -1113,7 +1194,11 @@ class BackendClient {
     return res.id ? res : null;
   }
 
-  /** Owner notification — only called when the script fully stops. */
+  /**
+   * Owner notification. Kinds: "stopped" | "selectors" | "account"
+   * (full stops) and "permission" (an unknown permission prompt was
+   * found and left alone — the worker pauses instead of approving).
+   */
   notifyOwner(kind, message) {
     return this.call('alert', { kind, message });
   }
@@ -1429,6 +1514,91 @@ class GeminiAdapter {
     return firstMatch(SELECTORS.modelMenu) != null;
   }
 
+  /**
+   * Permission-prompt watcher (MCP tool approval, neon-mcp only).
+   * `handlers`:
+   *  getConfig: () => ({ serverName, toolNames })
+   *  isActive: () => boolean — approvals only while the worker runs
+   *  onApproved: ({ tool, serverName, promptText }) => void
+   *  onUnknown: (promptText) => void — a prompt that does not belong
+   *    to our server: never clicked, handed to the caller to pause
+   *    the worker and alert the owner.
+   * Watches with a MutationObserver plus a 2 s fallback poll. Never
+   * clicks "Deny", and never approves anything outside
+   * gemini.google.com (guarded here as well as by the @match).
+   * Returns { stop }.
+   */
+  startPermissionWatcher(handlers) {
+    const noop = { stop() {} };
+    if (!window.location.hostname.endsWith('gemini.google.com')) return noop;
+    const seen = new WeakSet(); // prompt buttons already handled once
+    let stopped = false;
+    let lastScan = 0;
+
+    const scan = () => {
+      if (stopped) return;
+      // Throttle: the page mutates constantly while generating; the
+      // 2 s poll guarantees detection even when scans are skipped.
+      const now = Date.now();
+      if (now - lastScan < 500) return;
+      lastScan = now;
+      const patterns = TEXT_MATCH.permissionButtons;
+      const candidates = [...document.querySelectorAll('button')].filter((b) => {
+        if (!visible(b) || seen.has(b)) return false;
+        return matchPermissionButton(b.innerText || b.textContent, patterns) != null;
+      });
+      for (const button of candidates) {
+        const container =
+          button.closest(SELECTORS.permissionDialog.join(', ')) || button.parentElement;
+        if (!container) continue;
+        const promptText = (container.innerText || '').trim();
+        const kinds = [...container.querySelectorAll('button')]
+          .map((b) => matchPermissionButton(b.innerText || b.textContent, patterns))
+          .filter(Boolean);
+        if (!kinds.length) continue;
+        // Mark every button in this prompt as seen: one prompt is
+        // handled once, even if it re-renders or stays on screen.
+        for (const b of container.querySelectorAll('button')) seen.add(b);
+        const { serverName, toolNames } = handlers.getConfig();
+        const verdict = classifyPermissionPrompt({ text: promptText, buttons: kinds, serverName, toolNames });
+        if (verdict.decision === 'unknown') {
+          handlers.onUnknown(truncatePromptText(promptText));
+          continue;
+        }
+        if (!handlers.isActive()) continue; // approve only while running
+        // Ours: wait a human-like 400-1200 ms, then prefer
+        // "Always allow", else "Allow". Re-checked right before the
+        // click: a paused worker or a vanished prompt clicks nothing.
+        const targetKind = verdict.decision === 'approve-always' ? 'always' : 'allow';
+        const target =
+          [...container.querySelectorAll('button')].find(
+            (b) => matchPermissionButton(b.innerText || b.textContent, patterns) === targetKind,
+          ) || button;
+        const tool = verdict.tool || 'tool';
+        setTimeout(async () => {
+          if (stopped || !handlers.isActive()) return;
+          await waitMs(randomMs(400, 1200));
+          if (stopped || !handlers.isActive() || !target.isConnected) return;
+          target.click();
+          this.log(`auto-approved ${tool} for ${serverName}`);
+          handlers.onApproved({ tool: verdict.tool, serverName, promptText: truncatePromptText(promptText) });
+        }, 0);
+      }
+    };
+
+    const observer = new MutationObserver(() => scan());
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    const timer = setInterval(scan, 2000);
+    scan();
+    return {
+      stop() {
+        stopped = true;
+        observer.disconnect();
+        clearInterval(timer);
+      },
+    };
+  }
+
   /** Close any open menu (Escape), best effort. */
   closeMenu() {
     document.dispatchEvent(
@@ -1569,6 +1739,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   bridgeKey: '',
   workerId: '',
   gemUrl: '', // optional: when set, Gem mode is ON (default OFF)
+  mcpServerName: 'neon-mcp',
+  mcpToolNames: ['repo_info', 'list_dir', 'read_file', 'get_task', 'submit_file', 'ask_question', 'report_status'],
   quietHours: { start: '02:00', end: '08:00' },
   paceMinSec: 60,
   paceMaxSec: 180,
@@ -1681,6 +1853,8 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     ['bridgeKey', 'Bridge key', 'password'],
     ['workerId', 'Worker ID', 'text'],
     ['gemUrl', 'Gem URL (optional, Gem mode)', 'text'],
+    ['mcpServerName', 'MCP server name (auto-approve)', 'text'],
+    ['mcpToolNames', 'MCP tool names (comma-separated)', 'list'],
     ['paceMinSec', 'Pace min (sec)', 'number'],
     ['paceMaxSec', 'Pace max (sec)', 'number'],
     ['maxAttemptsPerCard', 'Max attempts / card', 'number'],
@@ -1691,10 +1865,15 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     const wrap = el('label', '', label);
     const input = el('input');
     input.id = `nb2-set-${key}`;
-    input.type = type;
-    input.value = String(settings[key] ?? '');
+    input.type = type === 'list' ? 'text' : type;
+    input.value = type === 'list' ? (settings[key] || []).join(', ') : String(settings[key] ?? '');
     input.addEventListener('change', () => {
-      const value = type === 'number' ? Number(input.value) : input.value;
+      const value =
+        type === 'number'
+          ? Number(input.value)
+          : type === 'list'
+            ? input.value.split(',').map((s) => s.trim()).filter(Boolean)
+            : input.value;
       settings[key] = value;
       store.set(`nb2-${key}`, value);
     });
@@ -1865,6 +2044,11 @@ function loadSettings(store) {
     const saved = store.get(key, undefined);
     if (saved !== undefined) settings[key] = saved;
   }
+  // mcpToolNames is a list; an old stored string is split, not kept.
+  if (typeof settings.mcpToolNames === 'string') {
+    settings.mcpToolNames = settings.mcpToolNames.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  if (!Array.isArray(settings.mcpToolNames)) settings.mcpToolNames = [...DEFAULT_SETTINGS.mcpToolNames];
   return settings;
 }
 
@@ -1977,6 +2161,7 @@ function start() {
         quotaPct: state.quotaPct,
         lastError: state.stoppedReason || null,
         version: NB2_VERSION,
+        lastAutoApproval: state.lastAutoApproval,
       });
     } catch (err) {
       log(`heartbeat failed: ${err.message}`);
@@ -2010,6 +2195,7 @@ function start() {
   async function fullStop(kind, message) {
     state.running = false;
     state.stoppedReason = message;
+    permissionWatcher?.stop();
     persistState(store, state);
     if (panel) {
       panel.setState(`Stopped: ${message}`);
@@ -2557,6 +2743,41 @@ function start() {
     panel.setCard(`#${state.pending.card.seq} ${state.pending.card.file_path} (resumed)`);
   }
   log(lock.held ? 'Neon Bridge v2 ready' : 'Neon Bridge v2 ready (idle: another tab holds the lock)');
+
+  // Permission-prompt watcher (neon-mcp auto-approve). It runs for
+  // the whole page session; approvals only happen while the worker
+  // runs, and an unknown prompt pauses the worker instead of ever
+  // clicking anything. See src/core/permission.js for the rule.
+  let permissionWatcher = null;
+  permissionWatcher = adapter.startPermissionWatcher({
+    getConfig: () => ({ serverName: settings.mcpServerName, toolNames: settings.mcpToolNames }),
+    isActive: () => state.running && lock.held,
+    onApproved: ({ tool, serverName }) => {
+      const label = `auto-approved ${tool || 'tool'} for ${serverName}`;
+      state.lastAutoApproval = label;
+      persistState(store, state);
+      sendHeartbeat('running'); // state change: approval to report
+    },
+    onUnknown: (promptText) => {
+      // Only the tab holding the worker acts on prompts; the idle
+      // tab never pauses or alerts for them.
+      if (!lock.held) return;
+      // Never click anything. Pause the worker, show it in the
+      // panel, and alert the owner (this alert is not gated on
+      // alertOnStop: it is the prompt-injection guard).
+      state.running = false;
+      persistState(store, state);
+      if (panel) {
+        panel.setRunning(false);
+        panel.setState(`Paused — unknown permission prompt: ${promptText.slice(0, 80)}`);
+      }
+      log(`unknown permission prompt, NOT approved: ${promptText}`);
+      client.notifyOwner('permission', promptText).catch((err) => {
+        log(`permission alert failed: ${err.message}`);
+      });
+      sendHeartbeat('paused');
+    },
+  });
 
   // Best-effort quota read when landing on the usage page.
   if (window.location.href.startsWith(GEMINI_USAGE_URL)) {
