@@ -83,14 +83,16 @@ const SELECTORS = {
   // Model picker: the button in the input bar showing the current
   // mode name, and the menu it opens. [unverified — see README]
   modelPickerButton: [
+    'button[data-test-id="bard-mode-menu-button"]', // verified Nov 24 2026 (Persian UI)
+    'bard-mode-switcher button',
     'button[aria-label*="model" i]',
-    'button[aria-label*="Model" i]',
   ],
-  modelMenu: ['[role="menu"]', '[role="listbox"]'],
-  modelMenuItem: ['[role="menuitem"]', '[role="option"]', 'li'],
+  modelMenu: ['.cdk-overlay-pane [role="menu"]', '[role="menu"]', '[role="listbox"]'],
+  // verified: model rows are menuitemradio with data-test-id="bard-mode-option-*"; the last row (menuitem, aria-haspopup) opens thinking
+  modelMenuItem: ['gem-menu-item[role="menuitemradio"][data-test-id^="bard-mode-option"], gem-menu-item[role="menuitem"][aria-haspopup="true"]', '[role="menuitem"]', '[role="option"]'],
   // The last menu row opens the thinking-level submenu. [unverified]
-  thinkingSubmenuRow: ['[role="menu"] > *:last-child', '[role="listbox"] > *:last-child'],
-  thinkingOption: ['[role="menuitemradio"]', '[role="option"]', '[aria-checked]'],
+  thinkingSubmenuRow: ['gem-menu-item[role="menuitem"][aria-haspopup="true"]', '[role="menu"] > *:last-child'],
+  thinkingOption: ['gem-menu[role="menu"] gem-menu-item[role="menuitemradio"]', 'gem-menu-item[role="menuitemradio"]:not([data-test-id])', '[role="menuitemradio"]'],
 
   // Toasts / inline errors. [unverified]
   errorToast: ['[role="alert"]', '.error-toast', '[data-testid="error-toast"]'],
@@ -104,7 +106,8 @@ const SELECTORS = {
 
 /** Text fragments the adapter may match on (model names only in English). */
 const TEXT_MATCH = {
-  modelNames: { neon: 'Neon 4', hydrogen: 'Hydrogen', carbon: 'Carbon' },
+  // The Persian UI renders "4 Neon" (number first), so match the name only.
+  modelNames: { neon: 'Neon', hydrogen: 'Hydrogen', carbon: 'Carbon' },
   sendLabels: ['Send', 'ارسال'],
   stopLabels: ['Stop', 'توقف'],
   signedOut: ['Sign in', 'ورود'],
