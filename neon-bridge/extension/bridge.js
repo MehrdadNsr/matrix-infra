@@ -92,7 +92,8 @@ const SELECTORS = {
   modelMenuItem: ['gem-menu-item[role="menuitemradio"][data-test-id^="bard-mode-option"], gem-menu-item[role="menuitem"][aria-haspopup="true"]', '[role="menuitem"]', '[role="option"]'],
   // The last menu row opens the thinking-level submenu. [unverified]
   thinkingSubmenuRow: ['gem-menu-item[role="menuitem"][aria-haspopup="true"]', '[role="menu"] > *:last-child'],
-  thinkingOption: ['gem-menu[role="menu"] gem-menu-item[role="menuitemradio"]', 'gem-menu-item[role="menuitemradio"]:not([data-test-id])', '[role="menuitemradio"]'],
+  // ONE selector only: allMatches() unions every entry, so generic fallbacks would mix model rows into the thinking list.
+  thinkingOption: ['gem-menu[role="menu"] gem-menu-item[role="menuitemradio"]'],
 
   // Toasts / inline errors. [unverified]
   errorToast: ['[role="alert"]', '.error-toast', '[data-testid="error-toast"]'],
