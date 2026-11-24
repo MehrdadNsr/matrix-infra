@@ -198,6 +198,7 @@ const ERROR_KINDS = Object.freeze([
   'signed_out',
   'captcha',
   'unusual_traffic',
+  'no_mcp_tools',
   'weekly_cap',
   'quota',
   'generic',
@@ -237,6 +238,28 @@ const PATTERNS = [
       /unusual\s+traffic/i,
       /ترافیک\s*غیر\s*معمول/,
       /ترافیک\s*غیر\s*عادی/,
+    ],
+  },
+  {
+    // Gemini says it has no tools / cannot reach neon-mcp. Checked
+    // before 'generic' and 'quota' so a "no tools, try again" reply
+    // is recognised as a no-tools reply, not a generic error.
+    kind: 'no_mcp_tools',
+    patterns: [
+      /no\s+(mcp\s+)?tools/i,
+      /don'?t\s+have\s+(access\s+to\s+)?(any\s+)?tools/i,
+      /do\s+not\s+have\s+(access\s+to\s+)?(any\s+)?tools/i,
+      /can'?t\s+access\s+(the\s+)?neon-mcp/i,
+      /cannot\s+access\s+(the\s+)?neon-mcp/i,
+      /no\s+access\s+to\s+(the\s+)?tools/i,
+      /tools?\s+(are\s+)?not\s+available/i,
+      /without\s+tools/i,
+      /not\s+supported/i,
+      /ابزار(ها)?\s*(را)?\s*ندارم/,
+      /به\s*ابزار(ها)?\s*دسترسی\s*ندارم/,
+      /در\s*دسترس\s*نیست/,
+      /پشتیبانی\s*نمی‌شود/,
+      /نمی‌توانم\s*به\s*neon-mcp\s*دسترسی/,
     ],
   },
   {
@@ -744,6 +767,35 @@ function buildGemMessage(card, attempt = 1) {
   );
 }
 
+/**
+ * MCP-mode message. The first sentence rotates by attempt so a
+ * resend is never byte-identical; attempt 1 is the exact spec text.
+ * Gemini does the work through the neon-mcp tools and delivers the
+ * file with submit_file — it never pastes the file in the chat.
+ */
+const MCP_INTROS = Object.freeze([
+  'Use the neon-mcp tools only.',
+  'Please work through the neon-mcp tools only.',
+  'For this task, use the neon-mcp tools only.',
+  'Work with the neon-mcp tools only.',
+]);
+
+function mcpMessage(card, attempt = 1) {
+  const idx = ((attempt - 1) % MCP_INTROS.length + MCP_INTROS.length) % MCP_INTROS.length;
+  return (
+    `${MCP_INTROS[idx]} Call get_task with task_id=${card.id}. ` +
+    'Read the real files with read_file/list_dir, write the COMPLETE file, ' +
+    'and deliver it with submit_file. Never paste the file in the chat. ' +
+    'If something is unclear, call ask_question instead of guessing. ' +
+    `When submit_file succeeds, reply with the PR link and DONE-${card.id}.`
+  );
+}
+
+/** Sent once when Gemini's reply finished without submit_file. */
+function mcpNudgeMessage(card) {
+  return `You did not finish with submit_file. Call submit_file now with task_id=${card.id} and the complete file.`;
+}
+
 /** Ask for the rest of a cut-off answer, in the same chat. */
 function continueMessage(id) {
   return (
@@ -827,6 +879,67 @@ function classifyPermissionPrompt({ text, buttons, serverName, toolNames }) {
 function truncatePromptText(text, max = MAX_PROMPT_TEXT_CHARS) {
   const t = (text || '').replace(/\s+/g, ' ').trim();
   return t.length > max ? t.slice(0, max) : t;
+}
+
+
+// ---- src/core/modes.js ----
+// Mode choice + MCP health — pure logic, no DOM.
+//
+// Each card runs in one mode: MCP first (Gemini works through the
+// neon-mcp tools and delivers with submit_file), paste as the
+// fallback (send the prompt in the chat, supervise, extract, submit).
+// Settings.mode is "auto" | "mcp" | "paste" (default "auto").
+// Answered cards always run in paste mode: their answer is delivered
+// as chat text, which is a paste-mode interaction.
+
+const MODE_SETTING_VALUES = Object.freeze(['auto', 'mcp', 'paste']);
+const MCP_FALLBACKS_BEFORE_PASTE = 2; // consecutive fallbacks
+const MCP_HEALTH_WINDOW_MS = 30 * 60 * 1000; // paste for 30 min
+
+/** Fresh MCP health (persisted in the worker state). */
+function createMcpHealth() {
+  return { consecutiveFallbacks: 0, pasteUntil: 0 };
+}
+
+/**
+ * Decide the mode for a card.
+ * Input: { modeSetting, health, card, now }.
+ * health is { consecutiveFallbacks, pasteUntil } (ms epoch, 0 = none).
+ * - answered cards -> paste (the answer is chat text)
+ * - mode "paste" -> paste, always; mode "mcp" -> mcp, always
+ * - auto -> paste while inside the health window, else mcp
+ */
+function chooseMode({ modeSetting, health, card, now }) {
+  const setting = MODE_SETTING_VALUES.includes(modeSetting) ? modeSetting : 'auto';
+  if (card && card.status === 'answered') return 'paste';
+  if (setting === 'paste') return 'paste';
+  if (setting === 'mcp') return 'mcp';
+  const h = health || createMcpHealth();
+  if (h.pasteUntil && now < h.pasteUntil) return 'paste';
+  return 'mcp';
+}
+
+/**
+ * After an MCP fallback: one more consecutive fallback. The second
+ * consecutive fallback opens a 30-minute paste window, then MCP is
+ * tried again on the next card. Returns the new health.
+ */
+function recordMcpFallback(health, now) {
+  const h = health || createMcpHealth();
+  const consecutive = (h.consecutiveFallbacks || 0) + 1;
+  if (consecutive >= MCP_FALLBACKS_BEFORE_PASTE) {
+    return { consecutiveFallbacks: 0, pasteUntil: now + MCP_HEALTH_WINDOW_MS };
+  }
+  return { consecutiveFallbacks: consecutive, pasteUntil: 0 };
+}
+
+/**
+ * After MCP demonstrably worked (done, blocked via tools, or a
+ * backend "failed" status — the tools ran, the task itself failed):
+ * the fallback streak resets and any paste window closes.
+ */
+function recordMcpSuccess(health) {
+  return { consecutiveFallbacks: 0, pasteUntil: 0 };
 }
 
 
@@ -1007,6 +1120,7 @@ function createWorkerState() {
     blockedCount: 0, // cards waiting for an answer (status "blocked")
     latestQuestion: '', // text of the most recent routed question
     lastAutoApproval: null, // e.g. "auto-approved read_file for neon-mcp"
+    mcpHealth: { consecutiveFallbacks: 0, pasteUntil: 0 }, // MCP fallback streak + paste window (ms epoch)
   };
 }
 
@@ -1257,6 +1371,22 @@ function allMatches(selectors) {
   return out;
 }
 
+/**
+ * Matches of the FIRST selector that matches anything — no union.
+ * Use this for lists whose entries are NOT safe to union
+ * (modelMenuItem, thinkingOption): a generic fallback entry would
+ * mix rows from other menus into the list. allMatches() stays for
+ * lists where every entry is safe to union (stop button, busy
+ * indicators, user/model turns).
+ */
+function firstMatches(selectors, root = document) {
+  for (const sel of selectors) {
+    const found = [...root.querySelectorAll(sel)];
+    if (found.length) return found;
+  }
+  return [];
+}
+
 function visible(el) {
   if (!el) return false;
   const rect = el.getBoundingClientRect();
@@ -1431,6 +1561,20 @@ class GeminiAdapter {
   /** Busy indicators: generation in progress even without a stop button. */
   busyIndicatorsPresent() {
     return allMatches(SELECTORS.busyIndicators).length > 0;
+  }
+
+  /**
+   * Non-blocking snapshot for the MCP poll: is anything generating
+   * right now, and what does the last model turn say (thinking
+   * removed)? Unlike waitForCompletion this returns immediately.
+   */
+  generationState() {
+    const answers = allMatches(SELECTORS.modelResponse);
+    const last = answers.length ? answers[answers.length - 1] : null;
+    return {
+      generating: this.stopButtonPresent() || this.busyIndicatorsPresent(),
+      lastModelText: last ? answerTextWithoutThinking(last).trim() : '',
+    };
   }
 
   /**
@@ -1621,17 +1765,18 @@ class GeminiAdapter {
     const result = { modelSelectable: false, thinkingSelectable: false };
     try {
       if (!(await this.openModelMenu())) return result;
-      const items = allMatches(SELECTORS.modelMenuItem);
+      const items = firstMatches(SELECTORS.modelMenuItem);
       result.modelSelectable = items.some((el) =>
         Object.values(TEXT_MATCH.modelNames).some((name) => (el.innerText || '').includes(name)),
       );
-      const rows = [...(firstMatch(SELECTORS.modelMenu)?.querySelectorAll(SELECTORS.modelMenuItem.join(',')) || [])];
+      const menu = firstMatch(SELECTORS.modelMenu);
+      const rows = menu ? firstMatches(SELECTORS.modelMenuItem, menu) : [];
       const lastRow = rows[rows.length - 1];
       if (lastRow) {
         await this.humanPause();
         lastRow.click(); // opens the thinking submenu
         await waitMs(600);
-        result.thinkingSelectable = allMatches(SELECTORS.thinkingOption).filter(visible).length >= 3;
+        result.thinkingSelectable = firstMatches(SELECTORS.thinkingOption).filter(visible).length >= 3;
       }
       return result;
     } finally {
@@ -1639,12 +1784,12 @@ class GeminiAdapter {
     }
   }
 
-  /** Pick a model by its English name ("Neon 4", "Hydrogen"). */
+  /** Pick a model by its English name ("Neon", "Hydrogen"). */
   async setModel(modelKey) {
     const want = TEXT_MATCH.modelNames[modelKey];
     if (!want) return false;
     if (!(await this.openModelMenu())) return false;
-    const items = allMatches(SELECTORS.modelMenuItem);
+    const items = firstMatches(SELECTORS.modelMenuItem);
     const item = items.find((el) => (el.innerText || '').includes(want));
     if (!item) return false;
     // "Carbon" is locked: never pick it, and never click a locked row.
@@ -1658,6 +1803,47 @@ class GeminiAdapter {
   }
 
   /**
+   * Open the thinking submenu (last model-menu row) and return its
+   * visible options, or null when the menu does not open. Leaves the
+   * menu open; the caller closes it (or picks an option, which closes
+   * it on its own).
+   */
+  async openThinkingSubmenu() {
+    if (!(await this.openModelMenu())) return null;
+    const menu = firstMatch(SELECTORS.modelMenu);
+    if (!menu) return null;
+    const rows = firstMatches(SELECTORS.modelMenuItem, menu);
+    const lastRow = rows[rows.length - 1];
+    if (!lastRow) return null;
+    await this.humanPause();
+    lastRow.click(); // opens the thinking submenu
+    await waitMs(600);
+    return firstMatches(SELECTORS.thinkingOption).filter(visible);
+  }
+
+  /**
+   * Verify the thinking level by reopening the model menu and reading
+   * aria-checked on 'gem-menu[role="menu"] gem-menu-item[role=
+   * "menuitemradio"]' (index 0 low, 1 medium, 2 high), then closing
+   * the menu. The plain read-back cannot see the options once the
+   * menu closes, so this is the reliable check. Returns
+   * 'low' | 'medium' | 'high' | null (null = could not read).
+   */
+  async readThinkingViaMenu() {
+    let options = null;
+    try {
+      options = await this.openThinkingSubmenu();
+      if (!options) return null;
+      const checked = options.findIndex(
+        (o) => o.getAttribute('aria-checked') === 'true' || o.getAttribute('aria-selected') === 'true',
+      );
+      return checked >= 0 ? ['low', 'medium', 'high'][checked] : null;
+    } finally {
+      this.closeMenu();
+    }
+  }
+
+  /**
    * Pick a thinking level by index in the submenu the last menu row
    * opens: 0 = low, 1 = medium, 2 = high. Verifies the checkmark
    * (aria-checked / aria-selected / a check icon) afterwards.
@@ -1665,16 +1851,8 @@ class GeminiAdapter {
   async setThinking(level) {
     const index = ['low', 'medium', 'high'].indexOf(level);
     if (index < 0) return false;
-    if (!(await this.openModelMenu())) return false;
-    const menu = firstMatch(SELECTORS.modelMenu);
-    if (!menu) return false;
-    const rows = [...menu.querySelectorAll(SELECTORS.modelMenuItem.join(','))];
-    const lastRow = rows[rows.length - 1];
-    if (!lastRow) return false;
-    await this.humanPause();
-    lastRow.click(); // opens the thinking submenu
-    await waitMs(600);
-    const options = allMatches(SELECTORS.thinkingOption).filter(visible);
+    const options = await this.openThinkingSubmenu();
+    if (!options) return false;
     const option = options[index];
     if (!option) return false;
     await this.humanPause();
@@ -1685,7 +1863,7 @@ class GeminiAdapter {
 
   thinkingIsChecked(level) {
     const index = ['low', 'medium', 'high'].indexOf(level);
-    const options = allMatches(SELECTORS.thinkingOption).filter(visible);
+    const options = firstMatches(SELECTORS.thinkingOption).filter(visible);
     const option = options[index];
     if (!option) return false;
     if (option.getAttribute('aria-checked') === 'true') return true;
@@ -1702,9 +1880,11 @@ class GeminiAdapter {
       if (label.includes(name)) model = key;
     }
     // Thinking level has no reliable always-visible label; report what
-    // the submenu shows when it can be read, otherwise null.
+    // the submenu shows when it can be read, otherwise null. (When the
+    // menu is closed there are no options in the DOM — use
+    // readThinkingViaMenu() for a reliable check.)
     let thinking = null;
-    const options = allMatches(SELECTORS.thinkingOption);
+    const options = firstMatches(SELECTORS.thinkingOption);
     const checked = options.findIndex(
       (o) => o.getAttribute('aria-checked') === 'true' || o.getAttribute('aria-selected') === 'true',
     );
@@ -1745,6 +1925,9 @@ const DEFAULT_SETTINGS = Object.freeze({
   gemUrl: '', // optional: when set, Gem mode is ON (default OFF)
   mcpServerName: 'neon-mcp',
   mcpToolNames: ['repo_info', 'list_dir', 'read_file', 'get_task', 'submit_file', 'ask_question', 'report_status'],
+  mode: 'auto', // "auto" | "mcp" | "paste": which mode runs a card
+  mcpPickupTimeoutSec: 90, // MCP: give up if no tool use seen in this long
+  mcpTaskTimeoutMin: 25, // MCP: give up if the task is not done in this long
   quietHours: { start: '02:00', end: '08:00' },
   paceMinSec: 60,
   paceMaxSec: 180,
@@ -1824,6 +2007,10 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
   quotaLine.id = 'nb2-quota';
   body.appendChild(quotaLine);
 
+  const modeLine = el('div', 'nb2-small', 'Mode: MCP');
+  modeLine.id = 'nb2-mode';
+  body.appendChild(modeLine);
+
   const blockedLine = el('div', 'nb2-small', 'Blocked (waiting for answer): 0');
   blockedLine.id = 'nb2-blocked';
   body.appendChild(blockedLine);
@@ -1859,18 +2046,32 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     ['gemUrl', 'Gem URL (optional, Gem mode)', 'text'],
     ['mcpServerName', 'MCP server name (auto-approve)', 'text'],
     ['mcpToolNames', 'MCP tool names (comma-separated)', 'list'],
+    ['mode', 'Mode (auto / mcp / paste)', 'select', ['auto', 'mcp', 'paste']],
+    ['mcpPickupTimeoutSec', 'MCP pickup timeout (sec)', 'number'],
+    ['mcpTaskTimeoutMin', 'MCP task timeout (min)', 'number'],
     ['paceMinSec', 'Pace min (sec)', 'number'],
     ['paceMaxSec', 'Pace max (sec)', 'number'],
     ['maxAttemptsPerCard', 'Max attempts / card', 'number'],
     ['dailySoftCap', 'Daily soft cap', 'number'],
   ];
   const inputs = {};
-  for (const [key, label, type] of fields) {
+  for (const [key, label, type, options] of fields) {
     const wrap = el('label', '', label);
-    const input = el('input');
+    let input;
+    if (type === 'select') {
+      input = el('select');
+      for (const opt of options) {
+        const o = el('option', '', opt);
+        o.value = opt;
+        input.appendChild(o);
+      }
+      input.value = settings[key];
+    } else {
+      input = el('input');
+      input.type = type === 'list' ? 'text' : type;
+      input.value = type === 'list' ? (settings[key] || []).join(', ') : String(settings[key] ?? '');
+    }
     input.id = `nb2-set-${key}`;
-    input.type = type === 'list' ? 'text' : type;
-    input.value = type === 'list' ? (settings[key] || []).join(', ') : String(settings[key] ?? '');
     input.addEventListener('change', () => {
       const value =
         type === 'number'
@@ -1963,6 +2164,9 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     setCard(text) {
       cardLine.textContent = text;
     },
+    setMode(text) {
+      modeLine.textContent = text;
+    },
     setQuota(pct) {
       quotaLine.textContent = pct == null ? 'Quota: unknown' : `Quota remaining: ${pct}%`;
     },
@@ -1975,6 +2179,417 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
       pauseBtn.disabled = !running;
     },
   };
+}
+
+
+// ---- src/modes/paste.js ----
+// Paste mode — the original flow, moved here unchanged in behaviour:
+// send the prompt in the chat, wait for the answer, supervise it,
+// extract the code and submit. One attempt per call; the caller
+// (main.js) owns the attempt loop, the new-chat navigation, the
+// health check and the settings application.
+//
+// `ctx` (built by main.js) carries the shared wiring: client,
+// adapter, settings, state, panel, log, sleep, hangForever,
+// newChatTarget, applySettings, sendWithBounceRetry, failCard,
+// submitCard, checkCardActive, fetchLinkedTexts, buildTaskMessage,
+// gemModeActive, isRunning, updatePending, persistState, clearPending.
+// `s` is the attempt state (persisted in pending across navigations):
+// card, plan, model, thinking, attempt, maxAttempts, continues,
+// linksInlined, isAnswered, questions, answeredStage, promptResent,
+// answerSent, answerContext, lastQuestion, mode, mcp.
+//
+// Returns { outcome, reason? } where outcome is 'done' | 'failed' |
+// 'skipped' | 'blocked' | 'retry' | 'escalate'. Terminal failures
+// call ctx.failCard themselves, exactly as the flow did before the
+// split; 'retry' / 'escalate' mean "next attempt in a new chat".
+
+
+async function runPasteAttempt(ctx, s) {
+  const { card } = s;
+  const model = s.model;
+
+  // Answered card, first attempt: send the answers to the model's
+  // questions. In the fallback case the saved chat is gone, so the
+  // original prompt goes first to re-establish context.
+  if (s.isAnswered && s.answeredStage === 'fallback-ready' && !s.promptResent) {
+    const promptTurn = ctx.buildTaskMessage(card, s.attempt);
+    const ok = await ctx.adapter.insertText(promptTurn) &&
+      (await ctx.sendWithBounceRetry(promptTurn)).sent;
+    if (!ok) {
+      await ctx.failCard(card, model, 'could not re-send original prompt');
+      return { outcome: 'failed' };
+    }
+    const done = await ctx.adapter.waitForCompletion();
+    if (done.frozen) {
+      await ctx.failCard(card, model, 'page frozen while re-sending prompt');
+      return { outcome: 'failed' };
+    }
+    s.promptResent = true;
+    ctx.updatePending({ attempt: s.attempt, promptResent: true });
+  }
+
+  let message;
+  let sendingAnswer = false;
+  if (s.isAnswered && !s.answerSent) {
+    message = answerMessage(card.id, card.answer || '', s.attempt);
+    sendingAnswer = true;
+  } else if (s.answerContext) {
+    // Later attempts keep the Q&A so the model is not asked
+    // the same questions again in a fresh chat.
+    message = `${ctx.buildTaskMessage(card, s.attempt)}\n\n${s.answerContext}`;
+  } else {
+    message = ctx.buildTaskMessage(card, s.attempt);
+  }
+  if (!sendingAnswer && s.linksInlined && card.read_links && card.read_links.length) {
+    if (ctx.gemModeActive) {
+      // Gem mode: the Gem's instructions own the links; the full
+      // footer (and its inline-links form) is never sent there.
+      ctx.log('Gem mode: skipping inline-links retry');
+    } else {
+      const texts = await ctx.fetchLinkedTexts(card.read_links);
+      message = buildMessageWithLinks(card, texts, s.attempt);
+    }
+  }
+
+  if (ctx.settings.dryRun) {
+    ctx.log(`[dry run] would send ${message.length} chars to ${model}/${s.thinking}, then supervise + submit`);
+    ctx.clearPending();
+    return { outcome: 'done' };
+  }
+
+  const hash = await sentHash(message, s.attempt);
+  const claim = await ctx.client.claim(card.id, hash);
+  if (claim.duplicate) {
+    ctx.log(`claim 409: card #${card.seq} was already sent; moving on`);
+    ctx.clearPending();
+    return { outcome: 'skipped' };
+  }
+
+  const inserted = await ctx.adapter.insertText(message);
+  if (!inserted) {
+    await ctx.failCard(card, model, 'could not insert prompt');
+    return { outcome: 'failed' };
+  }
+  // Re-read before sending: an agent may have cancelled the card.
+  if (!(await ctx.checkCardActive(card))) {
+    ctx.clearPending();
+    return { outcome: 'skipped' };
+  }
+  const sent = await ctx.sendWithBounceRetry(message);
+  if (!sent.sent) {
+    await ctx.client.setStatus(card.id, { status: 'waiting', last_error: sent.reason, model_used: model });
+    const decision = decideAfterSendFailure(s.attempt, s.maxAttempts);
+    if (decision.action === 'fail') {
+      await ctx.failCard(card, model, sent.reason);
+      return { outcome: 'failed' };
+    }
+    return { outcome: 'retry' };
+  }
+  ctx.state.sentToday += 1;
+  if (sendingAnswer) {
+    s.answerSent = true;
+    s.answerContext = s.lastQuestion
+      ? `Earlier questions and answers:\nQ: ${s.lastQuestion}\nA: ${card.answer || ''}`
+      : '';
+    ctx.updatePending({ attempt: s.attempt, answerSent: true, answerContext: s.answerContext });
+  }
+  ctx.persistState();
+
+  await ctx.client.setStatus(card.id, { status: 'waiting', model_used: model });
+  const completion = await ctx.adapter.waitForCompletion();
+  if (completion.frozen) {
+    // The old chat is lost with the reload: count this attempt as
+    // consumed and resume as the next attempt in a fresh chat.
+    ctx.log('page frozen for 10 min; reloading into a new chat');
+    ctx.updatePending({ attempt: s.attempt });
+    ctx.adapter.newChat(ctx.newChatTarget());
+    await ctx.hangForever(); // the reload resumes as the next attempt
+    return { outcome: 'failed' }; // unreachable after navigation
+  }
+  if (completion.timedOut) ctx.log('generation timed out after 10 min');
+
+  // Supervise, with same-chat continues inside this attempt.
+  let messages = ctx.adapter.readMessages(5);
+  while (true) {
+    const lastModel = [...messages].reverse().find((m) => m.role === 'model');
+    if (lastModel && isCutOff(lastModel.text, card.id)) {
+      ctx.log('answer looks cut off (no END marker / unclosed fence); supervisor decides');
+    }
+    const sup = await ctx.client.supervise(card.id, messages);
+    let verdict = sup.verdict || {};
+    // The model may ask a QUESTION block even when the supervisor
+    // did not label it 'ask' — a detected QUESTION block wins.
+    const detected = lastModel ? detectQuestion(lastModel.text, card.id) : null;
+    if (verdict.action !== 'ask' && detected) {
+      verdict = { action: 'ask', question: detected.question };
+    }
+    const problem = verdictProblem(verdict);
+    if (problem) {
+      await ctx.failCard(card, model, `bad verdict: ${problem}`);
+      return { outcome: 'failed' };
+    }
+    ctx.log(`supervisor: ${verdict.action} — ${verdict.reason || ''}${verdict.stale ? ' (stale echo)' : ''}`);
+
+    // Ask is a first-class state, not an error: route the question
+    // to the backend (the card becomes "blocked" there), show it
+    // in the panel, and move on to the next card. Never wait here.
+    if (verdict.action === 'ask') {
+      const askRec = recordAsk({ attempt: s.attempt, questions: s.questions });
+      if (askRec.action === 'fail') {
+        await ctx.failCard(card, model, 'too many questions');
+        return { outcome: 'failed' };
+      }
+      const question = verdict.question || detected?.question || verdict.reason || 'No question text received';
+      await ctx.client.ask(card.id, question, window.location.href);
+      s.questions = askRec.questions;
+      ctx.state.blockedCount = (ctx.state.blockedCount || 0) + 1;
+      ctx.state.latestQuestion = question;
+      ctx.updatePending({ attempt: askRec.attempt, questions: s.questions, lastQuestion: question });
+      if (ctx.panel) ctx.panel.setBlocked(ctx.state.blockedCount, ctx.state.latestQuestion);
+      ctx.log(`question routed (round ${s.questions}/${MAX_QUESTIONS}): ${question}`);
+      return { outcome: 'blocked' };
+    }
+
+    // Links not read: one retry with the linked text pasted inline.
+    if (verdict.action === 'retry' && !s.linksInlined &&
+        classifyError(verdict.reason || '').kind === 'links_not_read' &&
+        card.read_links && card.read_links.length) {
+      s.linksInlined = true;
+      ctx.log('supervisor says links were not read; retrying with linked text inline');
+      return { outcome: 'retry' };
+    }
+
+    const decision = decideAfterVerdict({
+      verdict, attempt: s.attempt, maxAttempts: s.maxAttempts,
+      continues: s.continues, thinking: s.thinking,
+    });
+    if (decision.action === 'submit') {
+      const res = await ctx.submitCard(card, model, messages, verdict);
+      return { outcome: res }; // 'done' | 'failed' | 'skipped'
+    }
+    if (decision.action === 'fail') {
+      await ctx.failCard(card, model, decision.note || verdict.reason || 'failed');
+      return { outcome: 'failed' };
+    }
+    if (decision.action === 'escalate') {
+      s.thinking = decision.thinking;
+      ctx.log(`escalating thinking to ${s.thinking}`);
+      return { outcome: 'escalate' };
+    }
+    if (decision.action === 'retry') return { outcome: 'retry' };
+    // decision.action === 'continue': same chat, one more turn.
+    if (s.continues >= MAX_CONTINUES) {
+      await ctx.failCard(card, model, 'max continues reached');
+      return { outcome: 'failed' };
+    }
+    s.continues += 1;
+    ctx.updatePending({
+      attempt: s.attempt, continues: s.continues, thinking: s.thinking,
+      model, linksInlined: s.linksInlined,
+    });
+    await ctx.adapter.insertText(continueMessage(card.id));
+    await ctx.adapter.send();
+    await ctx.client.setStatus(card.id, { status: 'waiting', model_used: model });
+    await ctx.adapter.waitForCompletion();
+    messages = ctx.adapter.readMessages(5);
+    // Loop: supervise the now-longer history.
+  }
+}
+
+
+// ---- src/modes/mcp.js ----
+// MCP mode — Gemini works through the neon-mcp tools and delivers
+// the file with submit_file; the script polls the backend until the
+// card is done, blocked or failed, and only falls back to paste mode
+// on a pickup timeout, a "no tools" reply, or a task timeout.
+//
+// The poll decision (mcpPollDecision) is pure and unit-tested; the
+// wiring below (send + poll loop) is thin. `ctx` and `s` are the same
+// shapes paste.js uses (see its header). `s.mcp` is
+// { startedAt, nudged, seen, sent, lastText, lastTextAt } — persisted
+// in pending so a reload resumes polling instead of re-sending.
+
+
+const MCP_POLL_MS = 10000;
+const REPLY_STABLE_MS = 8000; // reply text unchanged this long = finished
+
+/**
+ * Pure poll decision. Input:
+ *  card: fresh card from the backend, or null when the backend does
+ *    not provide the card action
+ *  seen: whether mcp_seen_at was already non-null
+ *  nudged: whether the "did not submit" nudge was already sent
+ *  elapsedMs, pickupTimeoutMs, taskTimeoutMs
+ *  replyFinished: the reply ended (stop button gone, text stable)
+ *  replyText: the last model turn, thinking removed
+ * Returns { action, reason?, prUrl?, question?, seen } where action
+ * is 'done' | 'blocked' | 'failed' | 'fallback' | 'nudge' | 'wait'.
+ */
+function mcpPollDecision({
+  card, seen, nudged, elapsedMs, pickupTimeoutMs, taskTimeoutMs,
+  replyFinished, replyText,
+}) {
+  if (!card) return { action: 'fallback', reason: 'backend does not provide card action', seen };
+  if (card.status === 'done') {
+    return { action: 'done', prUrl: card.result_pr_url || card.pr_url || '', seen: seen || Boolean(card.mcp_seen_at) };
+  }
+  if (card.status === 'blocked') {
+    return {
+      action: 'blocked',
+      question: card.question || card.last_error || 'Question asked via MCP tools',
+      seen: seen || Boolean(card.mcp_seen_at),
+    };
+  }
+  if (card.status === 'failed') {
+    return { action: 'failed', reason: card.last_error || 'MCP task failed', seen: seen || Boolean(card.mcp_seen_at) };
+  }
+  const seenNow = seen || Boolean(card.mcp_seen_at);
+  // A "no tools" reply is recognised immediately — no point waiting
+  // for the pickup timeout when Gemini already said it cannot use
+  // the tools.
+  if (replyText && classifyError(replyText).kind === 'no_mcp_tools') {
+    return { action: 'fallback', reason: 'Gemini reports no MCP tools', seen: seenNow };
+  }
+  if (!seenNow && elapsedMs > pickupTimeoutMs) {
+    return { action: 'fallback', reason: `no MCP pickup in ${Math.round(pickupTimeoutMs / 1000)}s`, seen: seenNow };
+  }
+  if (elapsedMs > taskTimeoutMs) {
+    return { action: 'fallback', reason: `MCP task timeout (${Math.round(taskTimeoutMs / 60000)} min)`, seen: seenNow };
+  }
+  if (replyFinished && !nudged) return { action: 'nudge', seen: seenNow };
+  return { action: 'wait', seen: seenNow };
+}
+
+/**
+ * One MCP-mode attempt. Returns { outcome, reason?, mcpWorked? }
+ * where outcome is 'done' | 'failed' | 'skipped' | 'blocked' |
+ * 'retry' | 'fallback' | 'paused'. 'mcpWorked' is true when the
+ * tools demonstrably ran (done / blocked / backend-failed), so the
+ * caller can reset the fallback streak. A backend "failed" status is
+ * terminal there already — this function does NOT call failCard for
+ * it. 'paused' means the user paused mid-poll: pending is kept for
+ * resume, and the caller must not clear it.
+ */
+async function runMcpAttempt(ctx, s) {
+  const { card } = s;
+  const model = s.model;
+  const settings = ctx.settings;
+  const mcp = s.mcp || (s.mcp = {
+    startedAt: Date.now(), nudged: false, seen: false, sent: false,
+    lastText: '', lastTextAt: 0,
+  });
+
+  if (!mcp.sent) {
+    const message = mcpMessage(card, s.attempt);
+    if (settings.dryRun) {
+      ctx.log(`[dry run] would send MCP message (${message.length} chars) to ${model}/${s.thinking}, then poll for submit_file`);
+      ctx.clearPending();
+      return { outcome: 'done' };
+    }
+    const hash = await sentHash(message, s.attempt);
+    const claim = await ctx.client.claim(card.id, hash);
+    if (claim.duplicate) {
+      ctx.log(`claim 409: card #${card.seq} was already sent; moving on`);
+      ctx.clearPending();
+      return { outcome: 'skipped' };
+    }
+    const inserted = await ctx.adapter.insertText(message);
+    if (!inserted) {
+      await ctx.failCard(card, model, 'could not insert prompt');
+      return { outcome: 'failed' };
+    }
+    // Re-read before sending: an agent may have cancelled the card.
+    if (!(await ctx.checkCardActive(card))) {
+      ctx.clearPending();
+      return { outcome: 'skipped' };
+    }
+    const sent = await ctx.sendWithBounceRetry(message);
+    if (!sent.sent) {
+      await ctx.client.setStatus(card.id, { status: 'waiting', last_error: sent.reason, model_used: model });
+      const decision = decideAfterSendFailure(s.attempt, s.maxAttempts);
+      if (decision.action === 'fail') {
+        await ctx.failCard(card, model, sent.reason);
+        return { outcome: 'failed' };
+      }
+      return { outcome: 'retry' };
+    }
+    ctx.state.sentToday += 1;
+    ctx.persistState();
+    mcp.sent = true;
+    mcp.startedAt = Date.now();
+    ctx.updatePending({ mcp: { ...mcp } });
+  }
+
+  // Poll the backend every 10 s until the card is done, blocked or
+  // failed. The permission watcher (already running) auto-approves
+  // neon-mcp tool prompts while this runs.
+  while (true) {
+    if (!ctx.isRunning()) return { outcome: 'paused' };
+    let fresh = null;
+    try {
+      fresh = await ctx.client.card(card.id);
+    } catch (err) {
+      ctx.log(`card poll failed (${err.message}); retrying in 10s`);
+      await ctx.sleep(MCP_POLL_MS);
+      continue;
+    }
+    // Reply state: finished means the stop button is gone and the
+    // last model text has been stable for 8 s.
+    const gen = ctx.adapter.generationState();
+    let replyFinished = false;
+    if (!gen.generating && gen.lastModelText) {
+      if (gen.lastModelText !== mcp.lastText) {
+        mcp.lastText = gen.lastModelText;
+        mcp.lastTextAt = Date.now();
+      }
+      replyFinished = Date.now() - mcp.lastTextAt >= REPLY_STABLE_MS;
+    } else if (gen.generating) {
+      mcp.lastText = gen.lastModelText;
+      mcp.lastTextAt = Date.now();
+    }
+    const decision = mcpPollDecision({
+      card: fresh,
+      seen: mcp.seen,
+      nudged: mcp.nudged,
+      elapsedMs: Date.now() - mcp.startedAt,
+      pickupTimeoutMs: settings.mcpPickupTimeoutSec * 1000,
+      taskTimeoutMs: settings.mcpTaskTimeoutMin * 60 * 1000,
+      replyFinished,
+      replyText: gen.lastModelText,
+    });
+    mcp.seen = decision.seen || mcp.seen;
+    if (decision.action === 'done') {
+      ctx.log(`MCP done: card #${card.seq} -> ${decision.prUrl || 'ok'}`);
+      if (ctx.panel) ctx.panel.setCard(`#${card.seq} done — ${decision.prUrl || ''}`);
+      return { outcome: 'done', mcpWorked: true };
+    }
+    if (decision.action === 'blocked') {
+      ctx.state.blockedCount = (ctx.state.blockedCount || 0) + 1;
+      ctx.state.latestQuestion = decision.question;
+      if (ctx.panel) ctx.panel.setBlocked(ctx.state.blockedCount, ctx.state.latestQuestion);
+      ctx.log(`MCP blocked: question asked via tools (card #${card.seq})`);
+      return { outcome: 'blocked', mcpWorked: true };
+    }
+    if (decision.action === 'failed') {
+      ctx.log(`MCP failed: card #${card.seq} — ${decision.reason}`);
+      return { outcome: 'failed', reason: decision.reason, mcpWorked: true };
+    }
+    if (decision.action === 'fallback') {
+      return { outcome: 'fallback', reason: decision.reason };
+    }
+    if (decision.action === 'nudge') {
+      const nudge = mcpNudgeMessage(card);
+      const ok = await ctx.adapter.insertText(nudge) &&
+        (await ctx.sendWithBounceRetry(nudge)).sent;
+      // Sent once only, even when the send itself fails.
+      mcp.nudged = true;
+      if (ok) ctx.log('MCP nudge sent: asking Gemini to call submit_file now');
+      else ctx.log('MCP nudge failed to send; continuing to poll');
+    }
+    ctx.updatePending({ mcp: { ...mcp } });
+    await ctx.sleep(MCP_POLL_MS);
+  }
 }
 
 
@@ -2053,6 +2668,11 @@ function loadSettings(store) {
     settings.mcpToolNames = settings.mcpToolNames.split(',').map((s) => s.trim()).filter(Boolean);
   }
   if (!Array.isArray(settings.mcpToolNames)) settings.mcpToolNames = [...DEFAULT_SETTINGS.mcpToolNames];
+  if (!['auto', 'mcp', 'paste'].includes(settings.mode)) settings.mode = 'auto';
+  for (const key of ['mcpPickupTimeoutSec', 'mcpTaskTimeoutMin']) {
+    const n = Number(settings[key]);
+    settings[key] = Number.isFinite(n) && n > 0 ? n : DEFAULT_SETTINGS[key];
+  }
   return settings;
 }
 
@@ -2157,10 +2777,13 @@ function start() {
    * stops the worker.
    */
   async function sendHeartbeat(stateName) {
+    // While running, the heartbeat state carries the current mode,
+    // e.g. "running:mcp" or "running:paste".
+    const name = stateName === 'running' ? `running:${effectiveMode().mode}` : stateName;
     try {
       await client.heartbeat({
         worker: settings.workerId,
-        state: stateName,
+        state: name,
         cardId: state.pending?.card?.id || null,
         quotaPct: state.quotaPct,
         lastError: state.stoppedReason || null,
@@ -2217,7 +2840,10 @@ function start() {
   }
 
   /** Set model + thinking, read both back, retry once on mismatch.
-   *  Human timing: a random 2-6 s pause between the steps. */
+   *  Human timing: a random 2-6 s pause between the steps.
+   *  Thinking is verified by reopening the model menu and reading
+   *  aria-checked there: the plain read-back cannot see the options
+   *  once the menu closes. */
   async function applySettings(plan) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await adapter.setModel(plan.model);
@@ -2226,12 +2852,43 @@ function start() {
       await adapter.stepPause();
       const readBack = adapter.readSettings();
       const modelOk = !readBack.model || readBack.model === plan.model;
-      const thinkingOk = !readBack.thinking || readBack.thinking === plan.thinking;
+      const thinkingViaMenu = await adapter.readThinkingViaMenu();
+      const thinking = thinkingViaMenu || readBack.thinking;
+      const thinkingOk = !thinking || thinking === plan.thinking;
       if (modelOk && thinkingOk) return { ok: true, readBack };
       log(`settings mismatch (try ${attempt + 1}): wanted ${plan.model}/${plan.thinking}`);
       await sleep(1000);
     }
     return { ok: false };
+  }
+
+  /**
+   * The mode the worker is currently in: the in-flight card's mode,
+   * else the mode the next card would use. pasteUntil is the end of
+   * the MCP-health paste window (0 when none).
+   */
+  function effectiveMode() {
+    const health = state.mcpHealth || createMcpHealth();
+    const now = Date.now();
+    const inFlight = state.pending?.mode;
+    const pasteUntil = health.pasteUntil && now < health.pasteUntil ? health.pasteUntil : 0;
+    if (inFlight) return { mode: inFlight, pasteUntil };
+    const mode = chooseMode({ modeSetting: settings.mode, health, card: { status: 'queued' }, now });
+    return { mode, pasteUntil };
+  }
+
+  function modeLineText() {
+    const { mode, pasteUntil } = effectiveMode();
+    if (mode === 'mcp') return 'Mode: MCP';
+    if (pasteUntil) {
+      const until = new Date(pasteUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      return `Mode: PASTE until ${until}`;
+    }
+    return 'Mode: PASTE';
+  }
+
+  function updateModeLine() {
+    if (panel) panel.setMode(modeLineText());
   }
 
   /** Send the message, handling the bounce-back symptom once. */
@@ -2279,27 +2936,40 @@ function start() {
    * One card, start to finish. `resume` is a persisted pending entry
    * (after a navigation reload): same card, attempts already consumed,
    * and the fresh chat is already open, so no second navigation.
-   * Returns 'done' | 'failed' | 'skipped'.
+   * Returns 'done' | 'failed' | 'skipped' | 'blocked' | 'paused'.
+   * 'paused' means the user paused mid-card (MCP poll): pending is
+   * kept for resume, and the caller must not clear it.
    */
   async function runCard(card, resume = null) {
     const maxAttempts = settings.maxAttemptsPerCard;
     const planRes = resume ? { settings: resume.plan } : await client.plan(card.id);
     const plan = resolvePlan(card, planRes.settings || {});
     const model = plan.model;
-    let thinking = plan.thinking;
-    let attempt = resume ? resume.attempt : card.attempts || 0;
-    let continues = resume ? resume.continues : 0;
-    let linksInlined = resume ? resume.linksInlined : false;
-    // Ask/answer bookkeeping (persisted in pending across navigations).
-    const isAnswered = card.status === 'answered';
-    let questions = resume ? (resume.questions ?? 0) : (card.questions_asked ?? 0);
-    let answeredStage = resume ? (resume.answeredStage || null) : null;
-    let promptResent = resume ? Boolean(resume.promptResent) : false;
-    let answerSent = resume ? Boolean(resume.answerSent) : false;
-    let answerContext = resume ? (resume.answerContext || '') : '';
-    const lastQuestion = resume ? (resume.lastQuestion || '') : '';
+    if (!state.mcpHealth) state.mcpHealth = createMcpHealth();
 
-    log(`card #${card.seq} ${card.file_path} -> ${model}/${thinking} (${plan.reason || 'plan'})`);
+    // Attempt state (persisted in pending across navigations).
+    const s = {
+      card, plan, model,
+      thinking: plan.thinking,
+      maxAttempts,
+      attempt: resume ? resume.attempt : card.attempts || 0,
+      continues: resume ? resume.continues : 0,
+      linksInlined: resume ? resume.linksInlined : false,
+      isAnswered: card.status === 'answered',
+      questions: resume ? (resume.questions ?? 0) : (card.questions_asked ?? 0),
+      answeredStage: resume ? (resume.answeredStage || null) : null,
+      promptResent: resume ? Boolean(resume.promptResent) : false,
+      answerSent: resume ? Boolean(resume.answerSent) : false,
+      answerContext: resume ? (resume.answerContext || '') : '',
+      lastQuestion: resume ? (resume.lastQuestion || '') : '',
+      mode: resume ? (resume.mode || null) : null,
+      mcp: resume ? (resume.mcp || null) : null,
+    };
+    if (!s.mode) {
+      s.mode = chooseMode({ modeSetting: settings.mode, health: state.mcpHealth, card, now: Date.now() });
+    }
+
+    log(`card #${card.seq} ${card.file_path} -> ${model}/${s.thinking} (${plan.reason || 'plan'}) [${s.mode}]`);
 
     // Quota guard: below 20% only hydrogen/low may run.
     const quota = quotaDecision(state.quotaPct, plan);
@@ -2314,17 +2984,21 @@ function start() {
     // Answered card: open its saved chat if it still loads, otherwise
     // fall back to a new chat that re-sends the original prompt.
     // Each navigation reloads the page; the stage is persisted and
-    // the resume on load continues from it.
-    if (isAnswered) {
+    // the resume on load continues from it. Answered cards always
+    // run in paste mode (their answer is chat text).
+    if (s.isAnswered) {
       // The card is no longer blocked — count it once, on first entry.
       if (!resume) {
         state.blockedCount = Math.max(0, (state.blockedCount || 0) - 1);
         if (panel) panel.setBlocked(state.blockedCount, state.latestQuestion);
       }
-      if (!answeredStage) {
+      if (!s.answeredStage) {
         const base = {
-          card, plan, attempt, continues, thinking, model, linksInlined,
-          questions, promptResent, answerSent, answerContext, lastQuestion,
+          card: s.card, plan: s.plan, attempt: s.attempt, continues: s.continues,
+          thinking: s.thinking, model: s.model, linksInlined: s.linksInlined,
+          questions: s.questions, promptResent: s.promptResent,
+          answerSent: s.answerSent, answerContext: s.answerContext,
+          lastQuestion: s.lastQuestion, mode: s.mode, mcp: s.mcp,
         };
         if (card.chat_url) {
           state.pending = { ...base, answeredStage: 'open-chat' };
@@ -2340,19 +3014,22 @@ function start() {
         await hangForever(); // the reload resumes the card
         return 'blocked';
       }
-      if (answeredStage === 'open-chat') {
+      if (s.answeredStage === 'open-chat') {
         // We just loaded the saved chat. Did it actually load?
         const health = adapter.healthCheck();
         const sameChat = window.location.href === card.chat_url ||
           window.location.href.startsWith(card.chat_url);
         if (health.ok && sameChat) {
-          answeredStage = 'ready';
+          s.answeredStage = 'ready';
           log(`saved chat loaded for card #${card.seq}; continuing there`);
         } else {
           log('saved chat did not load; falling back to a new chat with the original prompt');
           state.pending = {
-            card, plan, attempt, continues, thinking, model, linksInlined,
-            questions, promptResent, answerSent, answerContext, lastQuestion,
+            card: s.card, plan: s.plan, attempt: s.attempt, continues: s.continues,
+            thinking: s.thinking, model: s.model, linksInlined: s.linksInlined,
+            questions: s.questions, promptResent: s.promptResent,
+            answerSent: s.answerSent, answerContext: s.answerContext,
+            lastQuestion: s.lastQuestion, mode: s.mode, mcp: s.mcp,
             answeredStage: 'fallback-ready',
           };
           persistState(store, state);
@@ -2365,16 +3042,42 @@ function start() {
 
     // A resume is already in a fresh chat; an answered card whose saved
     // chat loaded must also stay where it is — never navigate away.
-    let skipNavigation = Boolean(resume) || (isAnswered && answeredStage === 'ready');
+    let skipNavigation = Boolean(resume) || (s.isAnswered && s.answeredStage === 'ready');
 
-    while (attempt < maxAttempts) {
-      attempt += 1;
+    // Shared wiring for the mode attempts (see src/modes/paste.js).
+    const ctx = {
+      store, settings, state, client, adapter,
+      log, sleep, hangForever,
+      newChatTarget,
+      applySettings, sendWithBounceRetry, failCard, submitCard, checkCardActive,
+      fetchLinkedTexts: (urls) => fetchLinkedTexts(client, urls, log),
+      buildTaskMessage,
+      get panel() { return panel; },
+      get gemModeActive() { return gemModeActive; },
+      isRunning: () => state.running,
+      updatePending: (patch) => {
+        state.pending = { ...(state.pending || {}), ...patch };
+        persistState(store, state);
+      },
+      persistState: () => persistState(store, state),
+      clearPending: () => {
+        state.pending = null;
+        persistState(store, state);
+      },
+    };
+
+    while (s.attempt < maxAttempts) {
+      s.attempt += 1;
       const pending = {
-        card, plan, attempt: attempt - 1, continues, thinking, model, linksInlined,
-        questions, answeredStage, promptResent, answerSent, answerContext, lastQuestion,
+        card: s.card, plan: s.plan, attempt: s.attempt - 1, continues: s.continues,
+        thinking: s.thinking, model: s.model, linksInlined: s.linksInlined,
+        questions: s.questions, answeredStage: s.answeredStage,
+        promptResent: s.promptResent, answerSent: s.answerSent,
+        answerContext: s.answerContext, lastQuestion: s.lastQuestion,
+        mode: s.mode, mcp: s.mcp,
       };
       if (panel) {
-        panel.setCard(`#${card.seq} ${card.file_path} · ${model}/${thinking} · attempt ${attempt}/${maxAttempts}`);
+        panel.setCard(`#${card.seq} ${card.file_path} · ${model}/${s.thinking} · attempt ${s.attempt}/${maxAttempts} · ${s.mode.toUpperCase()}`);
       }
 
       // Always a NEW chat per card (long chats burn quota and repeat).
@@ -2387,7 +3090,7 @@ function start() {
         return 'failed';
       }
       skipNavigation = false;
-      state.pending = { ...pending, attempt };
+      state.pending = { ...pending, attempt: s.attempt };
       persistState(store, state);
 
       const health = adapter.healthCheck();
@@ -2400,185 +3103,47 @@ function start() {
         return failCard(card, model, health.problem);
       }
 
-      const applied = await applySettings({ model, thinking });
+      const applied = await applySettings({ model, thinking: s.thinking });
       if (!applied.ok) return failCard(card, model, 'settings mismatch');
 
       // Re-check right before every send (model/thinking can drift).
       const beforeSend = adapter.readSettings();
       if ((beforeSend.model && beforeSend.model !== model) ||
-          (beforeSend.thinking && beforeSend.thinking !== thinking)) {
+          (beforeSend.thinking && beforeSend.thinking !== s.thinking)) {
         log('model/thinking drifted before send; re-applying');
-        const reapplied = await applySettings({ model, thinking });
+        const reapplied = await applySettings({ model, thinking: s.thinking });
         if (!reapplied.ok) return failCard(card, model, 'settings mismatch');
       }
 
-      // Answered card, first attempt: send the answers to the model's
-      // questions. In the fallback case the saved chat is gone, so the
-      // original prompt goes first to re-establish context.
-      if (isAnswered && answeredStage === 'fallback-ready' && !promptResent) {
-        const promptTurn = buildTaskMessage(card, attempt);
-        const ok = await adapter.insertText(promptTurn) &&
-          (await sendWithBounceRetry(promptTurn)).sent;
-        if (!ok) return failCard(card, model, 'could not re-send original prompt');
-        const done = await adapter.waitForCompletion();
-        if (done.frozen) return failCard(card, model, 'page frozen while re-sending prompt');
-        promptResent = true;
-        state.pending = { ...pending, attempt, promptResent };
+      const result = s.mode === 'mcp'
+        ? await runMcpAttempt(ctx, s)
+        : await runPasteAttempt(ctx, s);
+
+      // MCP demonstrably worked (done, blocked via tools, or a
+      // backend "failed" status): reset the fallback streak.
+      if (s.mode === 'mcp' && (result.outcome === 'done' || result.outcome === 'blocked' || result.mcpWorked)) {
+        state.mcpHealth = recordMcpSuccess(state.mcpHealth);
         persistState(store, state);
+        updateModeLine();
       }
-      let message;
-      let sendingAnswer = false;
-      if (isAnswered && !answerSent) {
-        message = answerMessage(card.id, card.answer || '', attempt);
-        sendingAnswer = true;
-      } else if (answerContext) {
-        // Later attempts keep the Q&A so the model is not asked
-        // the same questions again in a fresh chat.
-        message = `${buildTaskMessage(card, attempt)}\n\n${answerContext}`;
-      } else {
-        message = buildTaskMessage(card, attempt);
+      if (result.outcome === 'done' || result.outcome === 'failed' ||
+          result.outcome === 'skipped' || result.outcome === 'blocked') {
+        return result.outcome;
       }
-      if (!sendingAnswer && linksInlined && card.read_links && card.read_links.length) {
-        if (gemModeActive) {
-          // Gem mode: the Gem's instructions own the links; the full
-          // footer (and its inline-links form) is never sent there.
-          log('Gem mode: skipping inline-links retry');
-        } else {
-          const texts = await fetchLinkedTexts(client, card.read_links, log);
-          message = buildMessageWithLinks(card, texts, attempt);
+      if (result.outcome === 'paused') return 'paused';
+      if (result.outcome === 'fallback') {
+        log(`MCP fallback: ${result.reason}`);
+        if (settings.mode === 'mcp') {
+          return failCard(card, model, `MCP fallback: ${result.reason}`);
         }
-      }
-
-      if (settings.dryRun) {
-        log(`[dry run] would send ${message.length} chars to ${model}/${thinking}, then supervise + submit`);
-        state.pending = null;
+        state.mcpHealth = recordMcpFallback(state.mcpHealth, Date.now());
         persistState(store, state);
-        return 'done';
+        s.mode = 'paste';
+        s.mcp = null;
+        updateModeLine();
+        continue; // same card, new chat, attempt + 1, in paste mode
       }
-
-      const hash = await sentHash(message, attempt);
-      const claim = await client.claim(card.id, hash);
-      if (claim.duplicate) {
-        log(`claim 409: card #${card.seq} was already sent; moving on`);
-        state.pending = null;
-        persistState(store, state);
-        return 'skipped';
-      }
-
-      const inserted = await adapter.insertText(message);
-      if (!inserted) return failCard(card, model, 'could not insert prompt');
-      // Re-read before sending: an agent may have cancelled the card.
-      if (!(await checkCardActive(card))) {
-        state.pending = null;
-        persistState(store, state);
-        return 'skipped';
-      }
-      const sent = await sendWithBounceRetry(message);
-      if (!sent.sent) {
-        await client.setStatus(card.id, { status: 'waiting', last_error: sent.reason, model_used: model });
-        const decision = decideAfterSendFailure(attempt, maxAttempts);
-        if (decision.action === 'fail') return failCard(card, model, sent.reason);
-        continue; // retry in a new chat (persist + navigate at loop top)
-      }
-      state.sentToday += 1;
-      if (sendingAnswer) {
-        answerSent = true;
-        answerContext = lastQuestion
-          ? `Earlier questions and answers:\nQ: ${lastQuestion}\nA: ${card.answer || ''}`
-          : '';
-        state.pending = { ...pending, attempt, answerSent, answerContext };
-      }
-      persistState(store, state);
-
-      await client.setStatus(card.id, { status: 'waiting', model_used: model });
-      const completion = await adapter.waitForCompletion();
-      if (completion.frozen) {
-        // The old chat is lost with the reload: count this attempt as
-        // consumed and resume as the next attempt in a fresh chat.
-        log('page frozen for 10 min; reloading into a new chat');
-        state.pending = { ...pending, attempt };
-        persistState(store, state);
-        adapter.newChat(newChatTarget());
-        await hangForever(); // the reload resumes as the next attempt
-        return 'failed';
-      }
-      if (completion.timedOut) log('generation timed out after 10 min');
-
-      // Supervise, with same-chat continues inside this attempt.
-      let messages = adapter.readMessages(5);
-      while (true) {
-        const lastModel = [...messages].reverse().find((m) => m.role === 'model');
-        if (lastModel && isCutOff(lastModel.text, card.id)) {
-          log('answer looks cut off (no END marker / unclosed fence); supervisor decides');
-        }
-        const sup = await client.supervise(card.id, messages);
-        let verdict = sup.verdict || {};
-        // The model may ask a QUESTION block even when the supervisor
-        // did not label it 'ask' — a detected QUESTION block wins.
-        const detected = lastModel ? detectQuestion(lastModel.text, card.id) : null;
-        if (verdict.action !== 'ask' && detected) {
-          verdict = { action: 'ask', question: detected.question };
-        }
-        const problem = verdictProblem(verdict);
-        if (problem) return failCard(card, model, `bad verdict: ${problem}`);
-        log(`supervisor: ${verdict.action} — ${verdict.reason || ''}${verdict.stale ? ' (stale echo)' : ''}`);
-
-        // Ask is a first-class state, not an error: route the question
-        // to the backend (the card becomes "blocked" there), show it
-        // in the panel, and move on to the next card. Never wait here.
-        if (verdict.action === 'ask') {
-          const askRec = recordAsk({ attempt, questions });
-          if (askRec.action === 'fail') {
-            return failCard(card, model, 'too many questions');
-          }
-          const question = verdict.question || detected?.question || verdict.reason || 'No question text received';
-          await client.ask(card.id, question, window.location.href);
-          questions = askRec.questions;
-          state.blockedCount = (state.blockedCount || 0) + 1;
-          state.latestQuestion = question;
-          state.pending = {
-            ...pending, attempt: askRec.attempt, questions, lastQuestion: question,
-          };
-          persistState(store, state);
-          if (panel) panel.setBlocked(state.blockedCount, state.latestQuestion);
-          log(`question routed (round ${questions}/${MAX_QUESTIONS}): ${question}`);
-          return 'blocked';
-        }
-
-        // Links not read: one retry with the linked text pasted inline.
-        if (verdict.action === 'retry' && !linksInlined &&
-            classifyError(verdict.reason || '').kind === 'links_not_read' &&
-            card.read_links && card.read_links.length) {
-          linksInlined = true;
-          log('supervisor says links were not read; retrying with linked text inline');
-          break; // out of the supervise loop -> retry in a new chat
-        }
-
-        const decision = decideAfterVerdict({ verdict, attempt, maxAttempts, continues, thinking });
-        if (decision.action === 'submit') return submitCard(card, model, messages, verdict);
-        if (decision.action === 'fail') {
-          return failCard(card, model, decision.note || verdict.reason || 'failed');
-        }
-        if (decision.action === 'escalate') {
-          thinking = decision.thinking;
-          log(`escalating thinking to ${thinking}`);
-          break; // out of the supervise loop -> new chat, resend
-        }
-        if (decision.action === 'retry') break; // new chat, resend
-        // decision.action === 'continue': same chat, one more turn.
-        if (continues >= MAX_CONTINUES) return failCard(card, model, 'max continues reached');
-        continues += 1;
-        state.pending = { ...pending, attempt, continues, thinking, model, linksInlined };
-        persistState(store, state);
-        await adapter.insertText(continueMessage(card.id));
-        await adapter.send();
-        await client.setStatus(card.id, { status: 'waiting', model_used: model });
-        await adapter.waitForCompletion();
-        messages = adapter.readMessages(5);
-        // Loop: supervise the now-longer history.
-      }
-      // Retry / escalate / links-inline: next while iteration navigates
-      // to a new chat (persisted at its top) and resends.
+      // 'retry' / 'escalate': next attempt in a new chat.
     }
 
     return failCard(card, model, 'max attempts reached');
@@ -2619,6 +3184,7 @@ function start() {
           continue;
         }
 
+        updateModeLine();
         const next = await client.next(settings.workerId);
         const card = chooseNextCard(next);
         if (!card) {
@@ -2628,6 +3194,11 @@ function start() {
         }
 
         const outcome = await runCard(card);
+        if (outcome === 'paused') {
+          // Paused mid-card (MCP poll): pending is kept for resume,
+          // so the loop stops here without clearing it.
+          break;
+        }
         if (outcome === 'failed') {
           state.consecutiveGenericFailures += 1;
           if (shouldStopAfterGenericFailures(state.consecutiveGenericFailures)) {
@@ -2738,6 +3309,7 @@ function start() {
   panel.setRunning(state.running);
   panel.setQuota(state.quotaPct);
   panel.setBlocked(state.blockedCount || 0, state.latestQuestion || '');
+  updateModeLine();
   panel.setState(
     state.stoppedReason ? `Stopped: ${state.stoppedReason}` :
     !lock.held ? 'Idle — another tab is running this worker' :
