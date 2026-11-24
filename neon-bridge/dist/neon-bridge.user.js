@@ -35,14 +35,24 @@
 
 const SELECTORS = {
   // Prompt editor (contenteditable). [spec]
-  editor: ['rich-textarea .ql-editor', '.ql-editor[contenteditable="true"]'],
+  // Extra fallbacks borrowed as an idea from Gemini Prompt Queue
+  // (nihaltp/uscripts, MIT): generic contenteditable textbox.
+  editor: [
+    'rich-textarea .ql-editor',
+    '.ql-editor[contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"]',
+  ],
 
   // Send button. Primary is the aria-label; the rest are fallbacks.
-  // The final fallback (last enabled button in the input area) is
-  // implemented by the adapter, not as a selector. [spec, fallbacks unverified]
+  // The data-testid / title variants are borrowed as an idea from
+  // Gemini Prompt Queue (nihaltp/uscripts, MIT). The final fallback
+  // (last enabled button in the input area) is implemented by the
+  // adapter, not as a selector. [spec, fallbacks unverified]
   send: [
     'button[aria-label*="Send" i]',
+    'button[data-testid="send-button"]',
     'button.send-button',
+    'button[title*="Send" i]',
     'button[aria-label*="ارسال"]',
   ],
   // The input area that contains the send button (for the last-button fallback).
@@ -58,7 +68,17 @@ const SELECTORS = {
   codeBlock: ['pre code'],
 
   // Stop-generation button (present while Gemini is answering).
-  stopButton: ['button[aria-label*="Stop" i]', 'button[aria-label*="توقف"]'],
+  // data-testid variant borrowed as an idea from Gemini Prompt Queue.
+  stopButton: [
+    'button[data-testid="stop-button"]',
+    'button[aria-label*="Stop" i]',
+    'button[aria-label*="توقف"]',
+  ],
+
+  // Busy indicators (also from Gemini Prompt Queue): a generation is
+  // in progress when any of these is present, even without a stop
+  // button. Used together with the stop button in waitForCompletion.
+  busyIndicators: ['[aria-busy="true"]', '[data-loading="true"]', '[role="progressbar"]'],
 
   // Model picker: the button in the input bar showing the current
   // mode name, and the menu it opens. [unverified — see README]
@@ -99,6 +119,7 @@ const SELECTOR_VERIFICATION = {
   modelThoughts: 'spec',
   codeBlock: 'spec',
   stopButton: 'unverified',
+  busyIndicators: 'unverified',
   modelPickerButton: 'unverified',
   modelMenu: 'unverified',
   modelMenuItem: 'unverified',
@@ -107,6 +128,12 @@ const SELECTOR_VERIFICATION = {
   errorToast: 'unverified',
   signInLink: 'unverified',
 };
+
+
+// ---- src/version.js ----
+// The script version, reported in every heartbeat.
+// build.mjs reads this file so the userscript header stays in sync.
+const NB2_VERSION = '0.1.0';
 
 
 // ---- src/core/hash.js ----
@@ -531,6 +558,31 @@ function minutesUntilQuietEnd(now, quietHours) {
   return t >= start ? 24 * 60 - t + end : end - t;
 }
 
+/** Heartbeat interval: other agents watch this to see the bridge is alive. */
+const HEARTBEAT_INTERVAL_MS = 60000;
+
+/** Random whole milliseconds in [minMs, maxMs]. `rand` is injectable. */
+function randomMs(minMs, maxMs, rand = Math.random) {
+  const lo = Math.min(minMs, maxMs);
+  const hi = Math.max(minMs, maxMs);
+  const r = Math.min(rand(), 1 - Number.EPSILON);
+  return lo + Math.floor(r * (hi - lo + 1));
+}
+
+/**
+ * Human-like pause before a click (300-900 ms). The script runs as a
+ * real user in a normal browser profile — never a bot framework —
+ * so clicks land with human timing instead of back-to-back.
+ */
+function humanClickDelayMs(rand = Math.random) {
+  return randomMs(300, 900, rand);
+}
+
+/** Human-like pause between steps: set model -> set thinking -> send. */
+function stepDelayMs(rand = Math.random) {
+  return randomMs(2000, 6000, rand);
+}
+
 /** Random whole seconds in [minSec, maxSec]. `rand` is injectable. */
 function randomPaceSec(minSec, maxSec, rand = Math.random) {
   const lo = Math.min(minSec, maxSec);
@@ -613,6 +665,24 @@ function dailyCapReached(sentToday, dailySoftCap) {
 // The exact footer text is part of the contract with the supervisor:
 // the CARD / END markers let the supervisor (and the extractor) tell
 // a complete answer from a cut-off one.
+//
+// Never send a byte-identical message twice: the short intro line
+// rotates by attempt number, so a resend after an error is worded
+// differently (the hash already includes the attempt number too).
+
+/** Short intro phrasings, rotated by attempt so resends are never byte-identical. */
+const INTRO_PHRASES = Object.freeze([
+  'Here is the next task.',
+  'Next up:',
+  'Here is another task for you.',
+  'Continuing with the next task:',
+]);
+
+/** Intro line for an attempt (1-based). Attempt 5 reuses attempt 1. */
+function introForAttempt(attempt) {
+  const idx = ((attempt - 1) % INTRO_PHRASES.length + INTRO_PHRASES.length) % INTRO_PHRASES.length;
+  return INTRO_PHRASES[idx];
+}
 
 /** The footer appended to every card prompt. `id` is the card id. */
 function messageFooter(id) {
@@ -630,16 +700,33 @@ function messageFooter(id) {
  * Message sent when a card comes back answered: the answers to the
  * model's questions, then the instruction to continue the task.
  */
-function answerMessage(id, answer) {
-  return (
+function answerMessage(id, answer, attempt = 1) {
+  const body =
     `Answer to your questions:\n${answer}\n` +
-    `Now continue the task. Same rules: one file, one code block, end with END-${id}.`
-  );
+    `Now continue the task. Same rules: one file, one code block, end with END-${id}.`;
+  // On a resend (attempt > 1) the rotating intro is prefixed so the
+  // message is never byte-identical to the first send.
+  return attempt > 1 ? `${introForAttempt(attempt)}\n\n${body}` : body;
 }
 
 /** Full message sent to Gemini for a card. */
-function buildMessage(card) {
-  return `${card.prompt}\n\n${messageFooter(card.id)}`;
+function buildMessage(card, attempt = 1) {
+  return `${introForAttempt(attempt)}\n\n${card.prompt}\n\n${messageFooter(card.id)}`;
+}
+
+/**
+ * Gem-mode message: only CARD <id> + the task, plus a one-line
+ * reminder. The standing rules live in the Gem's instructions, so
+ * the full footer is not sent. The intro still rotates by attempt
+ * so a resend is never byte-identical.
+ */
+function buildGemMessage(card, attempt = 1) {
+  return (
+    `CARD ${card.id}\n\n` +
+    `${introForAttempt(attempt)}\n\n` +
+    `${card.prompt}\n\n` +
+    `Follow your rules. End with END-${card.id}.`
+  );
 }
 
 /** Ask for the rest of a cut-off answer, in the same chat. */
@@ -652,11 +739,11 @@ function continueMessage(id) {
 }
 
 /** Message used when links were not read: prompt + linked text inline. */
-function buildMessageWithLinks(card, linkedTexts) {
+function buildMessageWithLinks(card, linkedTexts, attempt = 1) {
   const inline = linkedTexts
     .map((t) => `--- linked file: ${t.url} ---\n${t.text}`)
     .join('\n\n');
-  return `${card.prompt}\n\n${inline}\n\n${messageFooter(card.id)}`;
+  return `${introForAttempt(attempt)}\n\n${card.prompt}\n\n${inline}\n\n${messageFooter(card.id)}`;
 }
 
 
@@ -785,6 +872,14 @@ function chooseNextCard(response) {
   answered.sort(bySeq);
   queued.sort(bySeq);
   return answered[0] || queued[0] || null;
+}
+
+/**
+ * True when a card was cancelled by an agent: the worker must abort
+ * that card cleanly instead of sending or submitting for it.
+ */
+function isCancelledStatus(status) {
+  return status === 'skipped' || status === 'failed';
 }
 
 /** After a send/generic failure: retry the card, or fail it. */
@@ -984,6 +1079,40 @@ class BackendClient {
     return this.call('ask', { id, question, chat_url: chatUrl });
   }
 
+  /**
+   * Heartbeat so other agents can see whether the bridge is alive.
+   * Sent every 60 s and on every state change. A failed heartbeat
+   * never stops the worker — the caller logs it and moves on.
+   */
+  heartbeat({ worker, state, cardId, quotaPct, lastError, version }) {
+    return this.call('heartbeat', {
+      worker,
+      state,
+      card_id: cardId || null,
+      quota_pct: quotaPct == null ? null : quotaPct,
+      last_error: lastError || null,
+      version,
+    });
+  }
+
+  /**
+   * Lightweight re-read of one card. The backend may not provide
+   * this action: a 400/404/501 means "not provided" and returns
+   * null (the caller proceeds). Other errors are rethrown.
+   */
+  async card(id) {
+    let res;
+    try {
+      res = await this.call('card', { id });
+    } catch (err) {
+      if (err instanceof BridgeHttpError && [400, 404, 501].includes(err.status)) return null;
+      throw err;
+    }
+    if (!res || typeof res !== 'object') return null;
+    if (res.card && typeof res.card === 'object') return res.card;
+    return res.id ? res : null;
+  }
+
   /** Owner notification — only called when the script fully stops. */
   notifyOwner(kind, message) {
     return this.call('alert', { kind, message });
@@ -1110,13 +1239,14 @@ class GeminiAdapter {
   }
 
   /**
-   * New chat: navigate to /app. The caller persists state first —
-   * this reloads the page. Already on /app? A reload still opens a
-   * fresh chat, and an assignment to the same URL may not reload.
+   * New chat: navigate to `target` (a Gem URL in Gem mode, otherwise
+   * /app). The caller persists state first — this reloads the page.
+   * Already on the target? A reload still opens a fresh chat, and an
+   * assignment to the same URL may not reload.
    */
-  newChat() {
-    if (window.location.href.startsWith(GEMINI_APP_URL)) window.location.reload();
-    else window.location.href = GEMINI_APP_URL;
+  newChat(target = GEMINI_APP_URL) {
+    if (window.location.href.startsWith(target)) window.location.reload();
+    else window.location.href = target;
   }
 
   editor() {
@@ -1134,12 +1264,37 @@ class GeminiAdapter {
     return current.includes(text.slice(0, 80));
   }
 
-  /** Click send: aria-label "Send", then fallbacks, then the last
-   *  enabled button inside the input area. */
-  send() {
+  /** Human pause before a click (300-900 ms, random). */
+  async humanPause() {
+    await waitMs(humanClickDelayMs());
+  }
+
+  /** Human pause between steps: set model -> set thinking -> send. */
+  async stepPause() {
+    await waitMs(stepDelayMs());
+  }
+
+  /** Press Enter in the editor (send fallback when no send button is found). */
+  dispatchEnterKey() {
+    const editor = this.editor();
+    if (!editor) return false;
+    editor.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }),
+    );
+    return true;
+  }
+
+  /**
+   * Click send: aria-label "Send", then fallbacks, then the last
+   * enabled button inside the input area, then Enter in the editor
+   * (the Enter fallback is borrowed as an idea from Gemini Prompt
+   * Queue). Every click is preceded by a human pause.
+   */
+  async send() {
     for (const sel of SELECTORS.send) {
       const btn = document.querySelector(sel);
       if (btn && visible(btn) && !btn.disabled) {
+        await this.humanPause();
         btn.click();
         return true;
       }
@@ -1151,11 +1306,14 @@ class GeminiAdapter {
       );
       const last = buttons[buttons.length - 1];
       if (last) {
+        await this.humanPause();
         last.click();
         return true;
       }
     }
-    return false;
+    this.log('no send button found; falling back to Enter');
+    await this.humanPause();
+    return this.dispatchEnterKey();
   }
 
   /** True when a new user-query containing our text appeared. */
@@ -1181,6 +1339,11 @@ class GeminiAdapter {
     return allMatches(SELECTORS.stopButton).some((b) => visible(b) && !b.disabled);
   }
 
+  /** Busy indicators: generation in progress even without a stop button. */
+  busyIndicatorsPresent() {
+    return allMatches(SELECTORS.busyIndicators).length > 0;
+  }
+
   /**
    * Wait for generation to finish: the stop button is gone AND the
    * answer text has been unchanged for 8 s. Hard timeout 10 min.
@@ -1203,7 +1366,7 @@ class GeminiAdapter {
       if (Date.now() - lastChange > 10 * 60 * 1000) {
         return { done: false, timedOut: false, frozen: true };
       }
-      const generating = this.stopButtonPresent();
+      const generating = this.stopButtonPresent() || this.busyIndicatorsPresent();
       if (!generating && text.trim() !== '' && Date.now() - stableSince >= stableMs) {
         return { done: true, timedOut: false, frozen: false };
       }
@@ -1260,9 +1423,46 @@ class GeminiAdapter {
   async openModelMenu() {
     const btn = this.modelPickerButton();
     if (!btn) return false;
+    await this.humanPause();
     btn.click();
     await waitMs(600);
     return firstMatch(SELECTORS.modelMenu) != null;
+  }
+
+  /** Close any open menu (Escape), best effort. */
+  closeMenu() {
+    document.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }),
+    );
+    document.body.click();
+  }
+
+  /**
+   * Gem-mode probe: can the model and thinking level still be
+   * selected inside the current Gem? Opens the model menu read-only
+   * (nothing is picked) and checks for a known model name and for
+   * thinking options. Always closes the menu afterwards.
+   */
+  async probeModelControls() {
+    const result = { modelSelectable: false, thinkingSelectable: false };
+    try {
+      if (!(await this.openModelMenu())) return result;
+      const items = allMatches(SELECTORS.modelMenuItem);
+      result.modelSelectable = items.some((el) =>
+        Object.values(TEXT_MATCH.modelNames).some((name) => (el.innerText || '').includes(name)),
+      );
+      const rows = [...(firstMatch(SELECTORS.modelMenu)?.querySelectorAll(SELECTORS.modelMenuItem.join(',')) || [])];
+      const lastRow = rows[rows.length - 1];
+      if (lastRow) {
+        await this.humanPause();
+        lastRow.click(); // opens the thinking submenu
+        await waitMs(600);
+        result.thinkingSelectable = allMatches(SELECTORS.thinkingOption).filter(visible).length >= 3;
+      }
+      return result;
+    } finally {
+      this.closeMenu();
+    }
   }
 
   /** Pick a model by its English name ("Neon 4", "Hydrogen"). */
@@ -1277,6 +1477,7 @@ class GeminiAdapter {
     if (item.getAttribute('aria-disabled') === 'true' || item.classList.contains('disabled')) {
       return false;
     }
+    await this.humanPause();
     item.click();
     await waitMs(600);
     return true;
@@ -1296,11 +1497,13 @@ class GeminiAdapter {
     const rows = [...menu.querySelectorAll(SELECTORS.modelMenuItem.join(','))];
     const lastRow = rows[rows.length - 1];
     if (!lastRow) return false;
+    await this.humanPause();
     lastRow.click(); // opens the thinking submenu
     await waitMs(600);
     const options = allMatches(SELECTORS.thinkingOption).filter(visible);
     const option = options[index];
     if (!option) return false;
+    await this.humanPause();
     option.click();
     await waitMs(600);
     return this.thinkingIsChecked(level);
@@ -1365,6 +1568,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   backendUrl: '',
   bridgeKey: '',
   workerId: '',
+  gemUrl: '', // optional: when set, Gem mode is ON (default OFF)
   quietHours: { start: '02:00', end: '08:00' },
   paceMinSec: 60,
   paceMaxSec: 180,
@@ -1476,6 +1680,7 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     ['backendUrl', 'Backend URL', 'text'],
     ['bridgeKey', 'Bridge key', 'password'],
     ['workerId', 'Worker ID', 'text'],
+    ['gemUrl', 'Gem URL (optional, Gem mode)', 'text'],
     ['paceMinSec', 'Pace min (sec)', 'number'],
     ['paceMaxSec', 'Pace max (sec)', 'number'],
     ['maxAttemptsPerCard', 'Max attempts / card', 'number'],
@@ -1739,10 +1944,67 @@ function start() {
   const lock = acquireLock(settings.workerId || 'default');
 
   let panel;
+  // Gem mode is ON when a gemUrl is set. It can fall back to normal
+  // mode for this session if the Gem does not allow model/thinking
+  // selection (decided by the self-test probe at Start).
+  let gemModeActive = Boolean(settings.gemUrl);
 
   const log = (message) => {
     if (panel) panel.log(message);
   };
+
+  /** Message for one attempt: Gem mode sends only CARD + task + reminder. */
+  function buildTaskMessage(card, attempt) {
+    return gemModeActive ? buildGemMessage(card, attempt) : buildMessage(card, attempt);
+  }
+
+  /** Target for a "new chat" navigation: the Gem in Gem mode, /app otherwise. */
+  function newChatTarget() {
+    return gemModeActive && settings.gemUrl ? settings.gemUrl : undefined;
+  }
+
+  /**
+   * Heartbeat so other agents can see whether the bridge is alive:
+   * every 60 s and on every state change. A failed heartbeat never
+   * stops the worker.
+   */
+  async function sendHeartbeat(stateName) {
+    try {
+      await client.heartbeat({
+        worker: settings.workerId,
+        state: stateName,
+        cardId: state.pending?.card?.id || null,
+        quotaPct: state.quotaPct,
+        lastError: state.stoppedReason || null,
+        version: NB2_VERSION,
+      });
+    } catch (err) {
+      log(`heartbeat failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Re-read a card before a step (send / submit). If an agent
+   * cancelled it (status skipped/failed), abort the card cleanly.
+   * Returns true when the card may proceed. A backend that does not
+   * provide the card action returns null from client.card(), which
+   * also means "proceed".
+   */
+  async function checkCardActive(card) {
+    let fresh = null;
+    try {
+      fresh = await client.card(card.id);
+    } catch (err) {
+      log(`card re-read failed (${err.message}); proceeding`);
+      return true;
+    }
+    if (!fresh) return true;
+    if (isCancelledStatus(fresh.status)) {
+      log(`card #${card.seq} was ${fresh.status} by an agent; aborting cleanly`);
+      return false;
+    }
+    return true;
+  }
 
   /** Full stop: persist, notify the owner once, show it in the panel. */
   async function fullStop(kind, message) {
@@ -1754,6 +2016,7 @@ function start() {
       panel.setRunning(false);
     }
     log(`STOP (${kind}): ${message}`);
+    sendHeartbeat('stopped');
     if (settings.alertOnStop) {
       try {
         await client.notifyOwner(kind, message);
@@ -1763,11 +2026,14 @@ function start() {
     }
   }
 
-  /** Set model + thinking, read both back, retry once on mismatch. */
+  /** Set model + thinking, read both back, retry once on mismatch.
+   *  Human timing: a random 2-6 s pause between the steps. */
   async function applySettings(plan) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await adapter.setModel(plan.model);
+      await adapter.stepPause();
       await adapter.setThinking(plan.thinking);
+      await adapter.stepPause();
       const readBack = adapter.readSettings();
       const modelOk = !readBack.model || readBack.model === plan.model;
       const thinkingOk = !readBack.thinking || readBack.thinking === plan.thinking;
@@ -1780,12 +2046,12 @@ function start() {
 
   /** Send the message, handling the bounce-back symptom once. */
   async function sendWithBounceRetry(message) {
-    if (!adapter.send()) return { sent: false, reason: 'send button not found' };
+    if (!(await adapter.send())) return { sent: false, reason: 'send button not found' };
     const appeared = await adapter.waitForUserQuery(message, 10000);
     if (appeared) return { sent: true };
     if (adapter.editorHoldsText(message)) {
       log('message bounced back into the editor; pressing send once more');
-      if (!adapter.send()) return { sent: false, reason: 'send button not found on retry' };
+      if (!(await adapter.send())) return { sent: false, reason: 'send button not found on retry' };
       const appearedAgain = await adapter.waitForUserQuery(message, 10000);
       if (appearedAgain) return { sent: true };
     }
@@ -1800,6 +2066,12 @@ function start() {
   }
 
   async function submitCard(card, model, messages, verdict) {
+    // Re-read before submitting: an agent may have cancelled the card.
+    if (!(await checkCardActive(card))) {
+      state.pending = null;
+      persistState(store, state);
+      return 'skipped';
+    }
     const content = extractFinalFile(messages, verdict.message_indexes, card.id);
     if (!content) return failCard(card, model, 'no code extracted');
     const submitted = await client.submit(card.id, content, {
@@ -1874,7 +2146,7 @@ function start() {
         }
         state.pending = { ...base, answeredStage: 'fallback-ready' };
         persistState(store, state);
-        adapter.newChat();
+        adapter.newChat(newChatTarget());
         await hangForever(); // the reload resumes the card
         return 'blocked';
       }
@@ -1894,7 +2166,7 @@ function start() {
             answeredStage: 'fallback-ready',
           };
           persistState(store, state);
-          adapter.newChat();
+          adapter.newChat(newChatTarget());
           await hangForever(); // the reload resumes the card
           return 'blocked';
         }
@@ -1920,7 +2192,7 @@ function start() {
       if (!settings.dryRun && !skipNavigation) {
         state.pending = pending;
         persistState(store, state);
-        adapter.newChat();
+        adapter.newChat(newChatTarget());
         await hangForever(); // the reload resumes the card
         return 'failed';
       }
@@ -1954,7 +2226,7 @@ function start() {
       // questions. In the fallback case the saved chat is gone, so the
       // original prompt goes first to re-establish context.
       if (isAnswered && answeredStage === 'fallback-ready' && !promptResent) {
-        const promptTurn = buildMessage(card);
+        const promptTurn = buildTaskMessage(card, attempt);
         const ok = await adapter.insertText(promptTurn) &&
           (await sendWithBounceRetry(promptTurn)).sent;
         if (!ok) return failCard(card, model, 'could not re-send original prompt');
@@ -1967,18 +2239,24 @@ function start() {
       let message;
       let sendingAnswer = false;
       if (isAnswered && !answerSent) {
-        message = answerMessage(card.id, card.answer || '');
+        message = answerMessage(card.id, card.answer || '', attempt);
         sendingAnswer = true;
       } else if (answerContext) {
         // Later attempts keep the Q&A so the model is not asked
         // the same questions again in a fresh chat.
-        message = `${buildMessage(card)}\n\n${answerContext}`;
+        message = `${buildTaskMessage(card, attempt)}\n\n${answerContext}`;
       } else {
-        message = buildMessage(card);
+        message = buildTaskMessage(card, attempt);
       }
       if (!sendingAnswer && linksInlined && card.read_links && card.read_links.length) {
-        const texts = await fetchLinkedTexts(client, card.read_links, log);
-        message = buildMessageWithLinks(card, texts);
+        if (gemModeActive) {
+          // Gem mode: the Gem's instructions own the links; the full
+          // footer (and its inline-links form) is never sent there.
+          log('Gem mode: skipping inline-links retry');
+        } else {
+          const texts = await fetchLinkedTexts(client, card.read_links, log);
+          message = buildMessageWithLinks(card, texts, attempt);
+        }
       }
 
       if (settings.dryRun) {
@@ -1999,6 +2277,12 @@ function start() {
 
       const inserted = await adapter.insertText(message);
       if (!inserted) return failCard(card, model, 'could not insert prompt');
+      // Re-read before sending: an agent may have cancelled the card.
+      if (!(await checkCardActive(card))) {
+        state.pending = null;
+        persistState(store, state);
+        return 'skipped';
+      }
       const sent = await sendWithBounceRetry(message);
       if (!sent.sent) {
         await client.setStatus(card.id, { status: 'waiting', last_error: sent.reason, model_used: model });
@@ -2024,7 +2308,7 @@ function start() {
         log('page frozen for 10 min; reloading into a new chat');
         state.pending = { ...pending, attempt };
         persistState(store, state);
-        adapter.newChat();
+        adapter.newChat(newChatTarget());
         await hangForever(); // the reload resumes as the next attempt
         return 'failed';
       }
@@ -2097,7 +2381,7 @@ function start() {
         state.pending = { ...pending, attempt, continues, thinking, model, linksInlined };
         persistState(store, state);
         await adapter.insertText(continueMessage(card.id));
-        adapter.send();
+        await adapter.send();
         await client.setStatus(card.id, { status: 'waiting', model_used: model });
         await adapter.waitForCompletion();
         messages = adapter.readMessages(5);
@@ -2165,6 +2449,7 @@ function start() {
         }
         state.pending = null;
         persistState(store, state);
+        sendHeartbeat('running'); // state change: card finished
 
         // Pace before the next message.
         const paceSec = settings.dryRun ? 2 : randomPaceSec(settings.paceMinSec, settings.paceMaxSec);
@@ -2205,14 +2490,27 @@ function start() {
         await fullStop('selectors', `self-test failed, missing: ${test.missing.join(', ')}`);
         return;
       }
+      // Gem mode: confirm model + thinking can still be selected
+      // inside the Gem. If not, fall back to normal mode for this
+      // session (the saved gemUrl setting is left alone).
+      if (gemModeActive) {
+        const probe = await adapter.probeModelControls();
+        if (!probe.modelSelectable || !probe.thinkingSelectable) {
+          log(`Gem mode: model/thinking not selectable inside the Gem (model: ${probe.modelSelectable}, thinking: ${probe.thinkingSelectable}); falling back to normal mode`);
+          gemModeActive = false;
+        } else {
+          log('Gem mode: model + thinking selectable inside the Gem');
+        }
+      }
       client.backendUrl = settings.backendUrl;
       client.bridgeKey = settings.bridgeKey;
       state.running = true;
       state.stoppedReason = '';
       persistState(store, state);
       panel.setRunning(true);
-      panel.setState('Running');
-      log('started');
+      panel.setState(gemModeActive ? 'Running (Gem mode)' : 'Running');
+      log(gemModeActive ? 'started (Gem mode)' : 'started');
+      sendHeartbeat('running');
       loop();
     },
     onPause: () => {
@@ -2223,14 +2521,30 @@ function start() {
         panel.setState('Paused');
       }
       log('paused');
+      sendHeartbeat('paused');
     },
-    onSelfTest: () => {
+    onSelfTest: async () => {
       const test = adapter.selfTest();
       log(test.ok ? 'self-test OK: editor, send, model picker found' :
         `self-test FAILED, missing: ${test.missing.join(', ')}`);
       if (panel) panel.setState(test.ok ? 'Self-test OK' : `Self-test failed: ${test.missing.join(', ')}`);
+      if (test.ok && gemModeActive) {
+        const probe = await adapter.probeModelControls();
+        if (!probe.modelSelectable || !probe.thinkingSelectable) {
+          log(`Gem probe FAILED (model: ${probe.modelSelectable}, thinking: ${probe.thinkingSelectable}); falling back to normal mode`);
+          gemModeActive = false;
+        } else {
+          log('Gem probe OK: model + thinking selectable inside the Gem');
+        }
+      }
     },
   });
+
+  // Heartbeat every 60 s while running, so other agents can see the
+  // bridge is alive even between cards.
+  setInterval(() => {
+    if (state.running) sendHeartbeat('running');
+  }, HEARTBEAT_INTERVAL_MS);
   panel.setRunning(state.running);
   panel.setQuota(state.quotaPct);
   panel.setBlocked(state.blockedCount || 0, state.latestQuestion || '');
