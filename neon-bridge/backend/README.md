@@ -27,6 +27,8 @@ the header `x-bridge-key: <bridgeKey>`.
 | `supervise` | `{action:"supervise", id, messages:[{role:"user"\|"model", text}]}` | `{ok, verdict:{action:"accept"\|"continue"\|"retry"\|"escalate"\|"fail", message_indexes[], complete, needs_stitch, stale, reason}}` |
 | `submit` | `{action:"submit", id, content, model_used?, account_used?}` | `{ok, pr_url, commit}` |
 | `ask` | `{action:"ask", id, question, chat_url}` | `{ok}` — the card becomes status `blocked`; the backend routes the question to the agent that created the card (escalating to a senior agent if needed). The script does nothing else here and never waits for the answer. |
+| `heartbeat` | `{action:"heartbeat", worker, state, card_id?, quota_pct?, last_error?, version}` — `state` is `running` \| `paused` \| `stopped` \| `idle` | `{ok}` — lets other agents see whether the bridge is alive. Sent every 60 s and on every state change. |
+| `card` | `{action:"card", id}` | `{ok, card}` (or the card object directly). **Optional:** if the backend does not provide this action, return `400`, `404` or `501` and the script proceeds without the re-read. Used before send/submit so the script can abort a card an agent cancelled (`skipped`/`failed`). |
 | `alert` | `{action:"alert", kind:"stopped"\|"selectors"\|"account", message}` | `{ok}` — the backend emails the owner (rate-limited server-side). The script calls this only when it fully stops. |
 
 ### Card object (`next`)
@@ -77,6 +79,16 @@ Notes:
 4. In the panel, set a `workerId` per browser (one worker per
    browser — the script enforces it with a lock, but the backend
    should also treat two workers with the same id as one).
+
+## Future: OpenAI-compatible endpoint (not built)
+
+Tools like Cline or Claude Code should one day be able to call
+"neon" like a normal model: `POST /v1/chat/completions` on this
+backend, turning a request into a card and waiting for the result.
+That endpoint is **not part of this contract yet** — do not build it
+from this file alone. When it is built, it sits on top of the card /
+verdict shapes above; the userscript needs no changes for it beyond
+the new route.
 
 ### TODO: function source
 

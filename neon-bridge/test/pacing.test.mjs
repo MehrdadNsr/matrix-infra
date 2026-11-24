@@ -1,15 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  HEARTBEAT_INTERVAL_MS,
   backoffMs,
   dailyCapReached,
+  humanClickDelayMs,
   idlePollSec,
   isQuietHours,
   minutesUntilQuietEnd,
   msUntilNextRefresh,
   parseHHMM,
   quotaDecision,
+  randomMs,
   randomPaceSec,
+  stepDelayMs,
 } from '../src/core/pacing.js';
 
 function at(h, m) {
@@ -53,6 +57,15 @@ test('minutesUntilQuietEnd: daytime and overnight', () => {
   // 23:00 in a 22:00-06:00 range: 60 min to midnight + 360 = 420.
   assert.equal(minutesUntilQuietEnd(at(23, 0), { start: '22:00', end: '06:00' }), 420);
   assert.equal(minutesUntilQuietEnd(at(2, 0), { start: '22:00', end: '06:00' }), 240);
+});
+
+test('human timing: pre-click 300-900 ms, between steps 2-6 s', () => {
+  assert.equal(humanClickDelayMs(() => 0), 300);
+  assert.equal(humanClickDelayMs(() => 1), 900);
+  assert.equal(stepDelayMs(() => 0), 2000);
+  assert.equal(stepDelayMs(() => 1), 6000);
+  assert.equal(randomMs(100, 200, () => 0.5), 150);
+  assert.equal(HEARTBEAT_INTERVAL_MS, 60000);
 });
 
 test('randomPaceSec: stays in range, uses the injected random', () => {

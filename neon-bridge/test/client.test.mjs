@@ -95,6 +95,52 @@ test('client: ask() sends id, question and chat_url', async () => {
   assert.equal(calls[0].chat_url, 'https://gemini.google.com/app/abc123');
 });
 
+test('client: heartbeat sends worker, state, card, quota, version', async () => {
+  const { request, calls } = fakeTransport([json(200, { ok: true })]);
+  const client = new BackendClient({
+    backendUrl: 'https://b.example/', bridgeKey: 'k', request,
+  });
+  await client.heartbeat({
+    worker: 'w1', state: 'running', cardId: 'c9', quotaPct: 42, lastError: null, version: '0.1.0',
+  });
+  assert.equal(calls[0].action, 'heartbeat');
+  assert.equal(calls[0].worker, 'w1');
+  assert.equal(calls[0].state, 'running');
+  assert.equal(calls[0].card_id, 'c9');
+  assert.equal(calls[0].quota_pct, 42);
+  assert.equal(calls[0].version, '0.1.0');
+});
+
+test('client: card() normalizes {card} and bare card; 404 means not provided', async () => {
+  const ok = new BackendClient({
+    backendUrl: 'https://b.example/', bridgeKey: 'k',
+    request: async () => json(200, { ok: true, card: { id: 'c1', status: 'queued' } }),
+  });
+  assert.deepEqual(await ok.card('c1'), { id: 'c1', status: 'queued' });
+
+  const bare = new BackendClient({
+    backendUrl: 'https://b.example/', bridgeKey: 'k',
+    request: async () => json(200, { id: 'c2', status: 'skipped' }),
+  });
+  assert.deepEqual(await bare.card('c2'), { id: 'c2', status: 'skipped' });
+
+  const missing = new BackendClient({
+    backendUrl: 'https://b.example/', bridgeKey: 'k',
+    request: async () => json(404, { ok: false }),
+  });
+  assert.equal(await missing.card('c3'), null);
+
+  const { request: errReq } = fakeTransport([
+    json(500, { ok: false }),
+    json(500, { ok: false }),
+    json(500, { ok: false }),
+  ]);
+  const serverError = new BackendClient({
+    backendUrl: 'https://b.example/', bridgeKey: 'k', request: errReq,
+  });
+  await assert.rejects(serverError.card('c4'), /HTTP 500/);
+});
+
 test('client: fetchText caps at 60 KB', async () => {
   const client = new BackendClient({
     backendUrl: 'https://b.example/', bridgeKey: 'k',

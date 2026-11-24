@@ -8,6 +8,7 @@ import {
   decideAfterSendFailure,
   decideAfterVerdict,
   escalateThinking,
+  isCancelledStatus,
   recordAsk,
   resolvePlan,
   shouldStopAfterGenericFailures,
@@ -127,6 +128,15 @@ test('createWorkerState: fresh state has no pending card', () => {
   assert.equal(s.sentToday, 0);
   assert.equal(s.blockedCount, 0);
   assert.equal(s.latestQuestion, '');
+});
+
+test('isCancelledStatus: skipped/failed mean an agent cancelled the card', () => {
+  assert.equal(isCancelledStatus('skipped'), true);
+  assert.equal(isCancelledStatus('failed'), true);
+  assert.equal(isCancelledStatus('queued'), false);
+  assert.equal(isCancelledStatus('answered'), false);
+  assert.equal(isCancelledStatus('waiting'), false);
+  assert.equal(isCancelledStatus(null), false);
 });
 
 test('decideAfterVerdict: ask is a first-class state, not an error', () => {

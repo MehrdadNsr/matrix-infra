@@ -1,1 +1,1 @@
-{"alertOnStop":true,"backendUrl":"https://YOUR-BACKEND.example/bridge","bridgeKey":"YOUR_BRIDGE_KEY","dailySoftCap":50,"dryRun":false,"maxAttemptsPerCard":4,"paceMaxSec":180,"paceMinSec":60,"quietHours":{"end":"08:00","start":"02:00"},"workerId":"worker-1"}
+{"alertOnStop":true,"backendUrl":"https://YOUR-BACKEND.example/bridge","bridgeKey":"YOUR_BRIDGE_KEY","dailySoftCap":50,"dryRun":false,"gemUrl":"","maxAttemptsPerCard":4,"paceMaxSec":180,"paceMinSec":60,"quietHours":{"end":"08:00","start":"02:00"},"workerId":"worker-1"}

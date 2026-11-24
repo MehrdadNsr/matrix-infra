@@ -15,6 +15,7 @@ const REQUIRED_KEYS = [
   'modelThoughts',
   'codeBlock',
   'stopButton',
+  'busyIndicators',
   'modelPickerButton',
   'modelMenu',
   'modelMenuItem',

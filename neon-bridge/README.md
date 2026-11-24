@@ -129,6 +129,83 @@ Detected in the adapter, classified in `src/core/errors.js`
 Only full stops call the backend `alert` action (rate-limited
 server-side).
 
+## Staying a real user
+
+The script runs only as a Tampermonkey userscript in a normal Chrome
+profile. It never uses Playwright, Puppeteer, CDP, remote debugging,
+or cookie/token extraction — recent Google account bans mostly hit
+third-party clients that use Google backends, plus repetitive request
+patterns, so the script stays a plain user of the web UI:
+
+- Random 300–900 ms pause before every click, random 2–6 s between
+  "set model", "set thinking" and "send", plus the random per-card
+  pacing, quiet hours and daily cap.
+- Never a byte-identical message twice: the short intro line rotates
+  across 4 phrasings by attempt number, and the `sent_hash` includes
+  the attempt number.
+
+## Heartbeat and remote visibility
+
+Other agents can see whether the bridge is alive: the script sends
+`{action:"heartbeat", worker, state, card_id?, quota_pct?,
+last_error?, version}` every 60 s and on every state change
+(started, paused, card finished, stopped). A failed heartbeat never
+stops the worker.
+
+Before sending a message and before submitting, the script re-reads
+the card (`{action:"card", id}` when the backend provides it). If an
+agent cancelled it in the meantime (`status` became `skipped` or
+`failed`), the card is aborted cleanly and the worker moves on.
+
+## Gem mode (optional, default OFF)
+
+Set `gemUrl` in the panel to a Gemini Gem URL to turn Gem mode on:
+
+- "New chat" opens the Gem URL instead of `/app`.
+- The standing rules are assumed to live in the Gem's instructions,
+  so the script sends only `CARD <id>` + the task, plus the one-line
+  reminder "Follow your rules. End with `END-<id>`."
+- At Start (and on Self-test) the script probes whether model and
+  thinking can still be selected inside the Gem. If not, it logs the
+  fact and falls back to normal mode for that session (the saved
+  `gemUrl` is left alone).
+
+## Known fragility
+
+- **Gemini UI updates may break selectors.** That is what
+  `src/selectors.js` (one map, with fallbacks) and the panel's
+  self-test are for: when a selector breaks, the worker stops and
+  reports the missing key instead of guessing.
+- **The tab must stay open and visible.** Use a dedicated window for
+  the bridge. Background-tab throttling can slow timers (browsers
+  throttle `setTimeout` in background tabs), so completion polling
+  and pacing get slower if the tab is hidden — the waits are
+  wall-clock based and still work, just later.
+
+## Future: OpenAI-compatible endpoint (not built)
+
+The intended seam for tools like Cline or Claude Code is an
+OpenAI-compatible endpoint on the backend,
+`POST /v1/chat/completions`, that turns a request into a card and
+waits for the result — so "neon" can be called like a normal model.
+That endpoint is **not built here**. The seam is already clean:
+every backend call goes through `BackendClient` (`src/backend/
+client.js`), and the card / verdict shapes in `backend/README.md`
+are the contract such an endpoint would sit on top of. No script
+changes are needed for it beyond pointing the client at the new
+route.
+
+## Prior art
+
+- [Gemini Prompt Queue](https://github.com/nihaltp/uscripts) by
+  nihaltp (MIT, per its own userscript header) — a queue userscript
+  for Gemini. Borrowed as *ideas* (not code): the `data-testid`
+  send/stop button fallbacks, the `title*="Send"` fallback, busy
+  indicators (`aria-busy` / `data-loading` / `progressbar`) for
+  generation detection, and the Enter-key fallback when no send
+  button is found. All code in this repo is original; no AGPL code
+  from any project is used.
+
 ## File tree
 
 ```
