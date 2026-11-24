@@ -23,6 +23,7 @@
 
 import { SELECTORS, TEXT_MATCH } from '../selectors.js';
 import { classifyError } from '../core/errors.js';
+import { humanClickDelayMs, stepDelayMs } from '../core/pacing.js';
 
 export const GEMINI_APP_URL = 'https://gemini.google.com/app';
 export const GEMINI_USAGE_URL = 'https://gemini.google.com/usage';
@@ -118,13 +119,14 @@ export class GeminiAdapter {
   }
 
   /**
-   * New chat: navigate to /app. The caller persists state first —
-   * this reloads the page. Already on /app? A reload still opens a
-   * fresh chat, and an assignment to the same URL may not reload.
+   * New chat: navigate to `target` (a Gem URL in Gem mode, otherwise
+   * /app). The caller persists state first — this reloads the page.
+   * Already on the target? A reload still opens a fresh chat, and an
+   * assignment to the same URL may not reload.
    */
-  newChat() {
-    if (window.location.href.startsWith(GEMINI_APP_URL)) window.location.reload();
-    else window.location.href = GEMINI_APP_URL;
+  newChat(target = GEMINI_APP_URL) {
+    if (window.location.href.startsWith(target)) window.location.reload();
+    else window.location.href = target;
   }
 
   editor() {
@@ -142,12 +144,37 @@ export class GeminiAdapter {
     return current.includes(text.slice(0, 80));
   }
 
-  /** Click send: aria-label "Send", then fallbacks, then the last
-   *  enabled button inside the input area. */
-  send() {
+  /** Human pause before a click (300-900 ms, random). */
+  async humanPause() {
+    await waitMs(humanClickDelayMs());
+  }
+
+  /** Human pause between steps: set model -> set thinking -> send. */
+  async stepPause() {
+    await waitMs(stepDelayMs());
+  }
+
+  /** Press Enter in the editor (send fallback when no send button is found). */
+  dispatchEnterKey() {
+    const editor = this.editor();
+    if (!editor) return false;
+    editor.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }),
+    );
+    return true;
+  }
+
+  /**
+   * Click send: aria-label "Send", then fallbacks, then the last
+   * enabled button inside the input area, then Enter in the editor
+   * (the Enter fallback is borrowed as an idea from Gemini Prompt
+   * Queue). Every click is preceded by a human pause.
+   */
+  async send() {
     for (const sel of SELECTORS.send) {
       const btn = document.querySelector(sel);
       if (btn && visible(btn) && !btn.disabled) {
+        await this.humanPause();
         btn.click();
         return true;
       }
@@ -159,11 +186,14 @@ export class GeminiAdapter {
       );
       const last = buttons[buttons.length - 1];
       if (last) {
+        await this.humanPause();
         last.click();
         return true;
       }
     }
-    return false;
+    this.log('no send button found; falling back to Enter');
+    await this.humanPause();
+    return this.dispatchEnterKey();
   }
 
   /** True when a new user-query containing our text appeared. */
@@ -189,6 +219,11 @@ export class GeminiAdapter {
     return allMatches(SELECTORS.stopButton).some((b) => visible(b) && !b.disabled);
   }
 
+  /** Busy indicators: generation in progress even without a stop button. */
+  busyIndicatorsPresent() {
+    return allMatches(SELECTORS.busyIndicators).length > 0;
+  }
+
   /**
    * Wait for generation to finish: the stop button is gone AND the
    * answer text has been unchanged for 8 s. Hard timeout 10 min.
@@ -211,7 +246,7 @@ export class GeminiAdapter {
       if (Date.now() - lastChange > 10 * 60 * 1000) {
         return { done: false, timedOut: false, frozen: true };
       }
-      const generating = this.stopButtonPresent();
+      const generating = this.stopButtonPresent() || this.busyIndicatorsPresent();
       if (!generating && text.trim() !== '' && Date.now() - stableSince >= stableMs) {
         return { done: true, timedOut: false, frozen: false };
       }
@@ -268,9 +303,46 @@ export class GeminiAdapter {
   async openModelMenu() {
     const btn = this.modelPickerButton();
     if (!btn) return false;
+    await this.humanPause();
     btn.click();
     await waitMs(600);
     return firstMatch(SELECTORS.modelMenu) != null;
+  }
+
+  /** Close any open menu (Escape), best effort. */
+  closeMenu() {
+    document.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }),
+    );
+    document.body.click();
+  }
+
+  /**
+   * Gem-mode probe: can the model and thinking level still be
+   * selected inside the current Gem? Opens the model menu read-only
+   * (nothing is picked) and checks for a known model name and for
+   * thinking options. Always closes the menu afterwards.
+   */
+  async probeModelControls() {
+    const result = { modelSelectable: false, thinkingSelectable: false };
+    try {
+      if (!(await this.openModelMenu())) return result;
+      const items = allMatches(SELECTORS.modelMenuItem);
+      result.modelSelectable = items.some((el) =>
+        Object.values(TEXT_MATCH.modelNames).some((name) => (el.innerText || '').includes(name)),
+      );
+      const rows = [...(firstMatch(SELECTORS.modelMenu)?.querySelectorAll(SELECTORS.modelMenuItem.join(',')) || [])];
+      const lastRow = rows[rows.length - 1];
+      if (lastRow) {
+        await this.humanPause();
+        lastRow.click(); // opens the thinking submenu
+        await waitMs(600);
+        result.thinkingSelectable = allMatches(SELECTORS.thinkingOption).filter(visible).length >= 3;
+      }
+      return result;
+    } finally {
+      this.closeMenu();
+    }
   }
 
   /** Pick a model by its English name ("Neon 4", "Hydrogen"). */
@@ -285,6 +357,7 @@ export class GeminiAdapter {
     if (item.getAttribute('aria-disabled') === 'true' || item.classList.contains('disabled')) {
       return false;
     }
+    await this.humanPause();
     item.click();
     await waitMs(600);
     return true;
@@ -304,11 +377,13 @@ export class GeminiAdapter {
     const rows = [...menu.querySelectorAll(SELECTORS.modelMenuItem.join(','))];
     const lastRow = rows[rows.length - 1];
     if (!lastRow) return false;
+    await this.humanPause();
     lastRow.click(); // opens the thinking submenu
     await waitMs(600);
     const options = allMatches(SELECTORS.thinkingOption).filter(visible);
     const option = options[index];
     if (!option) return false;
+    await this.humanPause();
     option.click();
     await waitMs(600);
     return this.thinkingIsChecked(level);

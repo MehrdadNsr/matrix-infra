@@ -2,6 +2,24 @@
 // The exact footer text is part of the contract with the supervisor:
 // the CARD / END markers let the supervisor (and the extractor) tell
 // a complete answer from a cut-off one.
+//
+// Never send a byte-identical message twice: the short intro line
+// rotates by attempt number, so a resend after an error is worded
+// differently (the hash already includes the attempt number too).
+
+/** Short intro phrasings, rotated by attempt so resends are never byte-identical. */
+export const INTRO_PHRASES = Object.freeze([
+  'Here is the next task.',
+  'Next up:',
+  'Here is another task for you.',
+  'Continuing with the next task:',
+]);
+
+/** Intro line for an attempt (1-based). Attempt 5 reuses attempt 1. */
+export function introForAttempt(attempt) {
+  const idx = ((attempt - 1) % INTRO_PHRASES.length + INTRO_PHRASES.length) % INTRO_PHRASES.length;
+  return INTRO_PHRASES[idx];
+}
 
 /** The footer appended to every card prompt. `id` is the card id. */
 export function messageFooter(id) {
@@ -19,16 +37,33 @@ export function messageFooter(id) {
  * Message sent when a card comes back answered: the answers to the
  * model's questions, then the instruction to continue the task.
  */
-export function answerMessage(id, answer) {
-  return (
+export function answerMessage(id, answer, attempt = 1) {
+  const body =
     `Answer to your questions:\n${answer}\n` +
-    `Now continue the task. Same rules: one file, one code block, end with END-${id}.`
-  );
+    `Now continue the task. Same rules: one file, one code block, end with END-${id}.`;
+  // On a resend (attempt > 1) the rotating intro is prefixed so the
+  // message is never byte-identical to the first send.
+  return attempt > 1 ? `${introForAttempt(attempt)}\n\n${body}` : body;
 }
 
 /** Full message sent to Gemini for a card. */
-export function buildMessage(card) {
-  return `${card.prompt}\n\n${messageFooter(card.id)}`;
+export function buildMessage(card, attempt = 1) {
+  return `${introForAttempt(attempt)}\n\n${card.prompt}\n\n${messageFooter(card.id)}`;
+}
+
+/**
+ * Gem-mode message: only CARD <id> + the task, plus a one-line
+ * reminder. The standing rules live in the Gem's instructions, so
+ * the full footer is not sent. The intro still rotates by attempt
+ * so a resend is never byte-identical.
+ */
+export function buildGemMessage(card, attempt = 1) {
+  return (
+    `CARD ${card.id}\n\n` +
+    `${introForAttempt(attempt)}\n\n` +
+    `${card.prompt}\n\n` +
+    `Follow your rules. End with END-${card.id}.`
+  );
 }
 
 /** Ask for the rest of a cut-off answer, in the same chat. */
@@ -41,9 +76,9 @@ export function continueMessage(id) {
 }
 
 /** Message used when links were not read: prompt + linked text inline. */
-export function buildMessageWithLinks(card, linkedTexts) {
+export function buildMessageWithLinks(card, linkedTexts, attempt = 1) {
   const inline = linkedTexts
     .map((t) => `--- linked file: ${t.url} ---\n${t.text}`)
     .join('\n\n');
-  return `${card.prompt}\n\n${inline}\n\n${messageFooter(card.id)}`;
+  return `${introForAttempt(attempt)}\n\n${card.prompt}\n\n${inline}\n\n${messageFooter(card.id)}`;
 }

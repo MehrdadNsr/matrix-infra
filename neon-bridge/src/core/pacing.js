@@ -44,6 +44,31 @@ export function minutesUntilQuietEnd(now, quietHours) {
   return t >= start ? 24 * 60 - t + end : end - t;
 }
 
+/** Heartbeat interval: other agents watch this to see the bridge is alive. */
+export const HEARTBEAT_INTERVAL_MS = 60000;
+
+/** Random whole milliseconds in [minMs, maxMs]. `rand` is injectable. */
+export function randomMs(minMs, maxMs, rand = Math.random) {
+  const lo = Math.min(minMs, maxMs);
+  const hi = Math.max(minMs, maxMs);
+  const r = Math.min(rand(), 1 - Number.EPSILON);
+  return lo + Math.floor(r * (hi - lo + 1));
+}
+
+/**
+ * Human-like pause before a click (300-900 ms). The script runs as a
+ * real user in a normal browser profile — never a bot framework —
+ * so clicks land with human timing instead of back-to-back.
+ */
+export function humanClickDelayMs(rand = Math.random) {
+  return randomMs(300, 900, rand);
+}
+
+/** Human-like pause between steps: set model -> set thinking -> send. */
+export function stepDelayMs(rand = Math.random) {
+  return randomMs(2000, 6000, rand);
+}
+
 /** Random whole seconds in [minSec, maxSec]. `rand` is injectable. */
 export function randomPaceSec(minSec, maxSec, rand = Math.random) {
   const lo = Math.min(minSec, maxSec);

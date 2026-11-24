@@ -150,6 +150,40 @@ export class BackendClient {
     return this.call('ask', { id, question, chat_url: chatUrl });
   }
 
+  /**
+   * Heartbeat so other agents can see whether the bridge is alive.
+   * Sent every 60 s and on every state change. A failed heartbeat
+   * never stops the worker — the caller logs it and moves on.
+   */
+  heartbeat({ worker, state, cardId, quotaPct, lastError, version }) {
+    return this.call('heartbeat', {
+      worker,
+      state,
+      card_id: cardId || null,
+      quota_pct: quotaPct == null ? null : quotaPct,
+      last_error: lastError || null,
+      version,
+    });
+  }
+
+  /**
+   * Lightweight re-read of one card. The backend may not provide
+   * this action: a 400/404/501 means "not provided" and returns
+   * null (the caller proceeds). Other errors are rethrown.
+   */
+  async card(id) {
+    let res;
+    try {
+      res = await this.call('card', { id });
+    } catch (err) {
+      if (err instanceof BridgeHttpError && [400, 404, 501].includes(err.status)) return null;
+      throw err;
+    }
+    if (!res || typeof res !== 'object') return null;
+    if (res.card && typeof res.card === 'object') return res.card;
+    return res.id ? res : null;
+  }
+
   /** Owner notification — only called when the script fully stops. */
   notifyOwner(kind, message) {
     return this.call('alert', { kind, message });

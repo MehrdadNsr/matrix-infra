@@ -13,10 +13,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(fileURLToPath(import.meta.url));
-const VERSION = '0.1.0';
+// The version lives in src/version.js (also reported in heartbeats);
+// the userscript header is derived from it so the two cannot drift.
+const VERSION = /NB2_VERSION = '([^']+)'/.exec(readFileSync(join(root, 'src/version.js'), 'utf8'))[1];
 
 const FILES = [
   'src/selectors.js',
+  'src/version.js',
   'src/core/hash.js',
   'src/core/errors.js',
   'src/core/extract.js',

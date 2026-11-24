@@ -14,14 +14,24 @@
 
 export const SELECTORS = {
   // Prompt editor (contenteditable). [spec]
-  editor: ['rich-textarea .ql-editor', '.ql-editor[contenteditable="true"]'],
+  // Extra fallbacks borrowed as an idea from Gemini Prompt Queue
+  // (nihaltp/uscripts, MIT): generic contenteditable textbox.
+  editor: [
+    'rich-textarea .ql-editor',
+    '.ql-editor[contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"]',
+  ],
 
   // Send button. Primary is the aria-label; the rest are fallbacks.
-  // The final fallback (last enabled button in the input area) is
-  // implemented by the adapter, not as a selector. [spec, fallbacks unverified]
+  // The data-testid / title variants are borrowed as an idea from
+  // Gemini Prompt Queue (nihaltp/uscripts, MIT). The final fallback
+  // (last enabled button in the input area) is implemented by the
+  // adapter, not as a selector. [spec, fallbacks unverified]
   send: [
     'button[aria-label*="Send" i]',
+    'button[data-testid="send-button"]',
     'button.send-button',
+    'button[title*="Send" i]',
     'button[aria-label*="ارسال"]',
   ],
   // The input area that contains the send button (for the last-button fallback).
@@ -37,7 +47,17 @@ export const SELECTORS = {
   codeBlock: ['pre code'],
 
   // Stop-generation button (present while Gemini is answering).
-  stopButton: ['button[aria-label*="Stop" i]', 'button[aria-label*="توقف"]'],
+  // data-testid variant borrowed as an idea from Gemini Prompt Queue.
+  stopButton: [
+    'button[data-testid="stop-button"]',
+    'button[aria-label*="Stop" i]',
+    'button[aria-label*="توقف"]',
+  ],
+
+  // Busy indicators (also from Gemini Prompt Queue): a generation is
+  // in progress when any of these is present, even without a stop
+  // button. Used together with the stop button in waitForCompletion.
+  busyIndicators: ['[aria-busy="true"]', '[data-loading="true"]', '[role="progressbar"]'],
 
   // Model picker: the button in the input bar showing the current
   // mode name, and the menu it opens. [unverified — see README]
@@ -78,6 +98,7 @@ export const SELECTOR_VERIFICATION = {
   modelThoughts: 'spec',
   codeBlock: 'spec',
   stopButton: 'unverified',
+  busyIndicators: 'unverified',
   modelPickerButton: 'unverified',
   modelMenu: 'unverified',
   modelMenuItem: 'unverified',

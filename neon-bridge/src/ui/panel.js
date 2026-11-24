@@ -8,6 +8,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   backendUrl: '',
   bridgeKey: '',
   workerId: '',
+  gemUrl: '', // optional: when set, Gem mode is ON (default OFF)
   quietHours: { start: '02:00', end: '08:00' },
   paceMinSec: 60,
   paceMaxSec: 180,
@@ -119,6 +120,7 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     ['backendUrl', 'Backend URL', 'text'],
     ['bridgeKey', 'Bridge key', 'password'],
     ['workerId', 'Worker ID', 'text'],
+    ['gemUrl', 'Gem URL (optional, Gem mode)', 'text'],
     ['paceMinSec', 'Pace min (sec)', 'number'],
     ['paceMaxSec', 'Pace max (sec)', 'number'],
     ['maxAttemptsPerCard', 'Max attempts / card', 'number'],

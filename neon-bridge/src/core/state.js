@@ -124,6 +124,14 @@ export function chooseNextCard(response) {
   return answered[0] || queued[0] || null;
 }
 
+/**
+ * True when a card was cancelled by an agent: the worker must abort
+ * that card cleanly instead of sending or submitting for it.
+ */
+export function isCancelledStatus(status) {
+  return status === 'skipped' || status === 'failed';
+}
+
 /** After a send/generic failure: retry the card, or fail it. */
 export function decideAfterSendFailure(attempt, maxAttempts) {
   return attempt >= maxAttempts
