@@ -1802,7 +1802,7 @@ async function waitFor(fn, timeoutMs, intervalMs = 250) {
 }
 
 /** The page's own text that indicates a blocking problem, if any. */
-function pageErrorText(toastSelectors) {
+function domPageErrorText(toastSelectors) {
   const bodyText = document.body ? document.body.innerText || '' : '';
   const toast = firstMatch(toastSelectors);
   const toastText = toast ? toast.innerText || '' : '';
