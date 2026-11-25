@@ -1,0 +1,180 @@
+// The one map of every selector the script uses.
+// A Gemini UI change means editing this file, not hunting through code.
+//
+// Each key maps to an ordered list of CSS selectors tried in order.
+// Keys marked 'spec' were given as verified page facts; keys marked
+// 'unverified' are best guesses the owner must check on the live page
+// (see README.md "Selectors not yet verified"). Text matching (model
+// names, "Send" / "ارسال") is done by the adapter using the strings in
+// TEXT_MATCH below — never match on other UI text, because the UI
+// language may be Persian.
+//
+// Model names are always matched in English: "Hydrogen", "Neon 4",
+// "Carbon" (locked).
+
+export const SELECTORS = {
+  // Prompt editor (contenteditable). [spec]
+  // Extra fallbacks borrowed as an idea from Gemini Prompt Queue
+  // (nihaltp/uscripts, MIT): generic contenteditable textbox.
+  editor: [
+    'rich-textarea .ql-editor',
+    '.ql-editor[contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"]',
+  ],
+
+  // Send button. Primary is the aria-label; the rest are fallbacks.
+  // The data-testid / title variants are borrowed as an idea from
+  // Gemini Prompt Queue (nihaltp/uscripts, MIT). The final fallback
+  // (last enabled button in the input area) is implemented by the
+  // adapter, not as a selector. [spec, fallbacks unverified]
+  send: [
+    'button[aria-label*="Send" i]',
+    'button[data-testid="send-button"]',
+    'button.send-button',
+    'button[title*="Send" i]',
+    'button[aria-label*="ارسال"]',
+  ],
+  // The input area that contains the send button (for the last-button fallback).
+  inputArea: ['rich-textarea', '[data-testid="input-area"]'],
+
+  // Conversation turns. [spec]
+  userQuery: ['user-query'],
+  modelResponse: ['model-response'],
+  messageContent: ['message-content'],
+  // Thinking sections inside an answer — excluded when reading text.
+  modelThoughts: ['model-thoughts', '[data-thoughts]', '.thinking-content'],
+  // Code blocks inside an answer. [spec]
+  codeBlock: ['pre code'],
+
+  // Stop-generation button (present while Gemini is answering).
+  // data-testid variant borrowed as an idea from Gemini Prompt Queue.
+  stopButton: [
+    'button[data-testid="stop-button"]',
+    'button[aria-label*="Stop" i]',
+    'button[aria-label*="توقف"]',
+  ],
+
+  // Busy indicators (also from Gemini Prompt Queue): a generation is
+  // in progress when any of these is present, even without a stop
+  // button. Used together with the stop button in waitForCompletion.
+  busyIndicators: ['[aria-busy="true"]', '[data-loading="true"]', '[role="progressbar"]'],
+
+  // Model picker: the button in the input bar showing the current
+  // mode name, and the menu it opens. [unverified — see README]
+  modelPickerButton: [
+    'button[data-test-id="bard-mode-menu-button"]', // verified Nov 24 2026 (Persian UI)
+    'bard-mode-switcher button',
+    'button[aria-label*="model" i]',
+  ],
+  modelMenu: ['.cdk-overlay-pane [role="menu"]', '[role="menu"]', '[role="listbox"]'],
+  // verified: model rows are menuitemradio with data-test-id="bard-mode-option-*"; the last row (menuitem, aria-haspopup) opens thinking
+  modelMenuItem: ['gem-menu-item[role="menuitemradio"][data-test-id^="bard-mode-option"], gem-menu-item[role="menuitem"][aria-haspopup="true"]', '[role="menuitem"]', '[role="option"]'],
+  // The last menu row opens the thinking-level submenu. [unverified]
+  thinkingSubmenuRow: ['gem-menu-item[role="menuitem"][aria-haspopup="true"]', '[role="menu"] > *:last-child'],
+  // ONE selector only: allMatches() unions every entry, so generic fallbacks would mix model rows into the thinking list.
+  thinkingOption: ['gem-menu[role="menu"] gem-menu-item[role="menuitemradio"]'],
+
+  // Toasts / inline errors. [unverified]
+  errorToast: ['[role="alert"]', '.error-toast', '[data-testid="error-toast"]'],
+
+  // Sign-in / captcha / unusual-traffic markers (checked by text too).
+  signInLink: ['a[href*="accounts.google.com"]'],
+
+  // Permission-prompt dialogs (MCP tool approval). [unverified]
+  permissionDialog: ['[role="dialog"]', '[role="alertdialog"]'],
+
+  // --- Muse web app (settings.museDomain, default muse.ai) ---
+  // ALL [unverified]: best guesses only, never checked on the live
+  // page. selfTest() reports exactly which keys are missing.
+  museEditor: ['[contenteditable="true"]', 'textarea'],
+  museSend: ['button[aria-label*="Send" i]', 'button[type="submit"]'],
+  museInputArea: ['form'],
+  museUserTurn: ['[data-message-author-role="user"]', '[data-testid*="user-message" i]'],
+  museAssistantTurn: ['[data-message-author-role="assistant"]', '[data-testid*="assistant-message" i]', 'article'],
+  museStopButton: ['button[aria-label*="Stop" i]'],
+  museBusyIndicators: ['[aria-busy="true"]', '[role="progressbar"]'],
+  museErrorToast: ['[role="alert"]'],
+
+  // --- Grok (grok.com) — ALL [unverified] ---
+  grokEditor: ['textarea[placeholder*="Ask Grok" i]', 'textarea', '[contenteditable="true"]'],
+  grokSend: ['button[aria-label*="Send" i]', 'button[type="submit"]'],
+  grokInputArea: ['form'],
+  grokUserTurn: ['[data-testid="user-message"]', '[data-message-author-role="user"]'],
+  grokAssistantTurn: ['[data-testid="assistant-message"]', '[data-testid*="grok-message" i]', 'article'],
+  grokStopButton: ['button[aria-label*="Stop" i]', 'button[aria-label*="stop generating" i]'],
+  grokBusyIndicators: ['[aria-busy="true"]', '[role="progressbar"]'],
+  grokErrorToast: ['[role="alert"]'],
+
+  // --- ChatGPT (chatgpt.com) — ALL [unverified] ---
+  chatgptEditor: ['#prompt-textarea', 'textarea#prompt-textarea', '[contenteditable="true"]'],
+  chatgptSend: ['button[data-testid="send-button"]', 'button[aria-label*="Send" i]'],
+  chatgptInputArea: ['form'],
+  chatgptUserTurn: ['div[data-message-author-role="user"]'],
+  chatgptAssistantTurn: ['div[data-message-author-role="assistant"]'],
+  chatgptStopButton: ['button[data-testid="stop-button"]', 'button[aria-label*="Stop" i]'],
+  chatgptBusyIndicators: ['[aria-busy="true"]', '[role="progressbar"]'],
+  chatgptErrorToast: ['[role="alert"]'],
+};
+
+/** Text fragments the adapter may match on (model names only in English). */
+export const TEXT_MATCH = {
+  // The Persian UI renders "4 Neon" (number first), so match the name only.
+  modelNames: { neon: 'Neon', hydrogen: 'Hydrogen', carbon: 'Carbon' },
+  sendLabels: ['Send', 'ارسال'],
+  stopLabels: ['Stop', 'توقف'],
+  signedOut: ['Sign in', 'ورود'],
+  captcha: ['captcha', 'unusual traffic', 'ترافیک غیرمعمول'],
+  // Permission-prompt buttons. Exact (anchored) match only: "Allow
+  // all" or "Allow once" must never match. Persian: «اجازه دادن» =
+  // Allow, «همیشه اجازه داده شود» = Always allow.
+  permissionButtons: {
+    always: [/^always allow$/i, /^همیشه اجازه داده شود$/],
+    allow: [/^allow$/i, /^اجازه دادن$/],
+  },
+};
+
+/** Which selector keys still need a live-page check by the owner. */
+export const SELECTOR_VERIFICATION = {
+  editor: 'spec',
+  send: 'spec-primary-only',
+  inputArea: 'unverified',
+  userQuery: 'spec',
+  modelResponse: 'spec',
+  messageContent: 'spec',
+  modelThoughts: 'spec',
+  codeBlock: 'spec',
+  stopButton: 'unverified',
+  busyIndicators: 'unverified',
+  modelPickerButton: 'unverified',
+  modelMenu: 'unverified',
+  modelMenuItem: 'unverified',
+  thinkingSubmenuRow: 'unverified',
+  thinkingOption: 'unverified',
+  errorToast: 'unverified',
+  signInLink: 'unverified',
+  permissionDialog: 'unverified',
+  museEditor: 'unverified',
+  museSend: 'unverified',
+  museInputArea: 'unverified',
+  museUserTurn: 'unverified',
+  museAssistantTurn: 'unverified',
+  museStopButton: 'unverified',
+  museBusyIndicators: 'unverified',
+  museErrorToast: 'unverified',
+  grokEditor: 'unverified',
+  grokSend: 'unverified',
+  grokInputArea: 'unverified',
+  grokUserTurn: 'unverified',
+  grokAssistantTurn: 'unverified',
+  grokStopButton: 'unverified',
+  grokBusyIndicators: 'unverified',
+  grokErrorToast: 'unverified',
+  chatgptEditor: 'unverified',
+  chatgptSend: 'unverified',
+  chatgptInputArea: 'unverified',
+  chatgptUserTurn: 'unverified',
+  chatgptAssistantTurn: 'unverified',
+  chatgptStopButton: 'unverified',
+  chatgptBusyIndicators: 'unverified',
+  chatgptErrorToast: 'unverified',
+};
