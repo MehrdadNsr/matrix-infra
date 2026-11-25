@@ -27,12 +27,19 @@ const FILES = [
   'src/core/message.js',
   'src/core/permission.js',
   'src/core/modes.js',
+  'src/core/chat.js',
   'src/core/state.js',
   'src/backend/client.js',
+  'src/adapters/dom.js',
   'src/adapters/gemini.js',
+  'src/adapters/muse.js',
+  'src/adapters/grok.js',
+  'src/adapters/chatgpt.js',
+  'src/adapters/index.js',
   'src/ui/panel.js',
   'src/modes/paste.js',
   'src/modes/mcp.js',
+  'src/modes/chat.js',
   'src/main.js',
 ];
 
@@ -40,10 +47,13 @@ const HEADER = `// ==UserScript==
 // @name         Neon Bridge v2
 // @namespace    https://example.invalid/neon-bridge
 // @version      ${VERSION}
-// @description  Works through a queue of coding task cards on Gemini: picks model/thinking, sends the prompt, supervises the answer, submits the file to a backend that opens a PR.
+// @description  One script, three jobs: code mode via MCP or copy-paste, and group-chat relay — on Gemini, Muse, Grok and ChatGPT, one tab each.
 // @author       Neon Bridge contributors
 // @license      MIT
 // @match        https://gemini.google.com/*
+// @match        https://grok.com/*
+// @match        https://chatgpt.com/*
+// @match        https://muse.ai/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue

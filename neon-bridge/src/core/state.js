@@ -175,5 +175,8 @@ export function createWorkerState() {
     latestQuestion: '', // text of the most recent routed question
     lastAutoApproval: null, // e.g. "auto-approved read_file for neon-mcp"
     mcpHealth: { consecutiveFallbacks: 0, pasteUntil: 0 }, // MCP fallback streak + paste window (ms epoch)
+    rooms: {}, // chat rooms joined: { [roomId]: { roomId, roomName, chatUrl, turns, replyTimes, lastHumanTs } }
+    pendingChat: null, // in-flight chat item, saved before navigation: { item, stage, expectedUrl?, summary? }
+    lastChatItem: '', // one-line summary of the last chat item, shown in the panel
   };
 }

@@ -14,6 +14,11 @@ export const DEFAULT_SETTINGS = Object.freeze({
   mode: 'auto', // "auto" | "mcp" | "paste": which mode runs a card
   mcpPickupTimeoutSec: 90, // MCP: give up if no tool use seen in this long
   mcpTaskTimeoutMin: 25, // MCP: give up if the task is not done in this long
+  agentName: '', // agent id for this tab; '' = the site default (gemini neon, muse muse, grok grok, chatgpt gpt)
+  museDomain: 'muse.ai', // the Muse web app's domain (also needs @match / manifest to run there)
+  codeEnabled: true, // code cards (MCP/paste); default false on muse/grok/gpt until their code flows exist
+  chatEnabled: true, // group-chat relay
+  allowedSenders: ['mehrdad', 'oracle', 'claude', 'morpheus', 'neon', 'muse', 'grok', 'gpt'],
   quietHours: { start: '02:00', end: '08:00' },
   paceMinSec: 60,
   paceMaxSec: 180,
@@ -61,7 +66,7 @@ function el(tag, className, text) {
  *  onStart / onPause / onSelfTest: callbacks wired by main.js
  * Returns { setState, setCard, setQuota, log, setRunning }.
  */
-export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
+export function createPanel({ store, settings, onStart, onPause, onSelfTest, onLeaveAllRooms }) {
   const style = el('style');
   style.textContent = CSS;
   document.head.appendChild(style);
@@ -105,6 +110,22 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
   questionLine.id = 'nb2-question';
   body.appendChild(questionLine);
 
+  const siteLine = el('div', 'nb2-small', 'Site: —');
+  siteLine.id = 'nb2-site';
+  body.appendChild(siteLine);
+
+  const agentLine = el('div', 'nb2-small', 'Agent: —');
+  agentLine.id = 'nb2-agent';
+  body.appendChild(agentLine);
+
+  const roomsLine = el('div', 'nb2-small', 'Rooms: none');
+  roomsLine.id = 'nb2-rooms';
+  body.appendChild(roomsLine);
+
+  const lastChatLine = el('div', 'nb2-small', '');
+  lastChatLine.id = 'nb2-lastchat';
+  body.appendChild(lastChatLine);
+
   const btnRow = el('div', 'nb2-row');
   const startBtn = el('button', 'nb2-primary', 'Start');
   startBtn.id = 'nb2-start';
@@ -115,7 +136,10 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
   const testBtn = el('button', '', 'Self-test');
   testBtn.id = 'nb2-selftest';
   testBtn.type = 'button';
-  btnRow.append(startBtn, pauseBtn, testBtn);
+  const leaveBtn = el('button', '', 'Leave all rooms');
+  leaveBtn.id = 'nb2-leave-rooms';
+  leaveBtn.type = 'button';
+  btnRow.append(startBtn, pauseBtn, testBtn, leaveBtn);
   body.appendChild(btnRow);
 
   const logBox = el('div', 'nb2-log', '');
@@ -135,6 +159,9 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     ['mode', 'Mode (auto / mcp / paste)', 'select', ['auto', 'mcp', 'paste']],
     ['mcpPickupTimeoutSec', 'MCP pickup timeout (sec)', 'number'],
     ['mcpTaskTimeoutMin', 'MCP task timeout (min)', 'number'],
+    ['agentName', 'Agent name (empty = site default)', 'text'],
+    ['museDomain', 'Muse web app domain', 'text'],
+    ['allowedSenders', 'Allowed senders (comma-separated)', 'list'],
     ['paceMinSec', 'Pace min (sec)', 'number'],
     ['paceMaxSec', 'Pace max (sec)', 'number'],
     ['maxAttemptsPerCard', 'Max attempts / card', 'number'],
@@ -166,7 +193,7 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
             ? input.value.split(',').map((s) => s.trim()).filter(Boolean)
             : input.value;
       settings[key] = value;
-      store.set(`nb2-${key}`, value);
+      store.set(key, value);
     });
     inputs[key] = input;
     wrap.appendChild(input);
@@ -184,13 +211,37 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
   quietEnd.value = settings.quietHours.end;
   const saveQuiet = () => {
     settings.quietHours = { start: quietStart.value || '02:00', end: quietEnd.value || '08:00' };
-    store.set('nb2-quietHours', settings.quietHours);
+    store.set('quietHours', settings.quietHours);
   };
   quietStart.addEventListener('change', saveQuiet);
   quietEnd.addEventListener('change', saveQuiet);
   quietRow.append(quietStart, el('span', '', '–'), quietEnd);
   quietLabel.appendChild(quietRow);
   form.appendChild(quietLabel);
+
+  const codeLabel = el('label', '', 'Code cards (MCP / paste)');
+  const codeCheck = el('input');
+  codeCheck.id = 'nb2-set-codeEnabled';
+  codeCheck.type = 'checkbox';
+  codeCheck.checked = settings.codeEnabled !== false;
+  codeCheck.addEventListener('change', () => {
+    settings.codeEnabled = codeCheck.checked;
+    store.set('codeEnabled', codeCheck.checked);
+  });
+  codeLabel.prepend(codeCheck);
+  form.appendChild(codeLabel);
+
+  const chatLabel = el('label', '', 'Group-chat relay');
+  const chatCheck = el('input');
+  chatCheck.id = 'nb2-set-chatEnabled';
+  chatCheck.type = 'checkbox';
+  chatCheck.checked = settings.chatEnabled !== false;
+  chatCheck.addEventListener('change', () => {
+    settings.chatEnabled = chatCheck.checked;
+    store.set('chatEnabled', chatCheck.checked);
+  });
+  chatLabel.prepend(chatCheck);
+  form.appendChild(chatLabel);
 
   const dryLabel = el('label', '', 'Dry run (no send, no submit)');
   const dryCheck = el('input');
@@ -199,7 +250,7 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
   dryCheck.checked = Boolean(settings.dryRun);
   dryCheck.addEventListener('change', () => {
     settings.dryRun = dryCheck.checked;
-    store.set('nb2-dryRun', dryCheck.checked);
+    store.set('dryRun', dryCheck.checked);
   });
   dryLabel.prepend(dryCheck);
   form.appendChild(dryLabel);
@@ -211,7 +262,7 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
   alertCheck.checked = settings.alertOnStop !== false;
   alertCheck.addEventListener('change', () => {
     settings.alertOnStop = alertCheck.checked;
-    store.set('nb2-alertOnStop', alertCheck.checked);
+    store.set('alertOnStop', alertCheck.checked);
   });
   alertLabel.prepend(alertCheck);
   form.appendChild(alertLabel);
@@ -241,6 +292,7 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
   startBtn.addEventListener('click', () => onStart && onStart());
   pauseBtn.addEventListener('click', () => onPause && onPause());
   testBtn.addEventListener('click', () => onSelfTest && onSelfTest());
+  leaveBtn.addEventListener('click', () => onLeaveAllRooms && onLeaveAllRooms());
 
   return {
     log,
@@ -259,6 +311,18 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest }) {
     setBlocked(count, latestQuestion) {
       blockedLine.textContent = `Blocked (waiting for answer): ${count}`;
       questionLine.textContent = latestQuestion ? `Latest question: ${latestQuestion}` : '';
+    },
+    setSite(text) {
+      siteLine.textContent = `Site: ${text}`;
+    },
+    setAgent(text) {
+      agentLine.textContent = `Agent: ${text}`;
+    },
+    setRooms(text) {
+      roomsLine.textContent = `Rooms: ${text}`;
+    },
+    setLastChat(text) {
+      lastChatLine.textContent = text ? `Last chat: ${text}` : '';
     },
     setRunning(running) {
       startBtn.disabled = running;

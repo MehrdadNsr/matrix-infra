@@ -46,6 +46,7 @@ export function minutesUntilQuietEnd(now, quietHours) {
 
 /** Heartbeat interval: other agents watch this to see the bridge is alive. */
 export const HEARTBEAT_INTERVAL_MS = 60000;
+export const CHAT_IDLE_POLL_MS = 20 * 1000; // room_poll every 20 s while idle (chat enabled)
 
 /** Random whole milliseconds in [minMs, maxMs]. `rand` is injectable. */
 export function randomMs(minMs, maxMs, rand = Math.random) {

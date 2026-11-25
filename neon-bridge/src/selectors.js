@@ -82,6 +82,38 @@ export const SELECTORS = {
 
   // Permission-prompt dialogs (MCP tool approval). [unverified]
   permissionDialog: ['[role="dialog"]', '[role="alertdialog"]'],
+
+  // --- Muse web app (settings.museDomain, default muse.ai) ---
+  // ALL [unverified]: best guesses only, never checked on the live
+  // page. selfTest() reports exactly which keys are missing.
+  museEditor: ['[contenteditable="true"]', 'textarea'],
+  museSend: ['button[aria-label*="Send" i]', 'button[type="submit"]'],
+  museInputArea: ['form'],
+  museUserTurn: ['[data-message-author-role="user"]', '[data-testid*="user-message" i]'],
+  museAssistantTurn: ['[data-message-author-role="assistant"]', '[data-testid*="assistant-message" i]', 'article'],
+  museStopButton: ['button[aria-label*="Stop" i]'],
+  museBusyIndicators: ['[aria-busy="true"]', '[role="progressbar"]'],
+  museErrorToast: ['[role="alert"]'],
+
+  // --- Grok (grok.com) — ALL [unverified] ---
+  grokEditor: ['textarea[placeholder*="Ask Grok" i]', 'textarea', '[contenteditable="true"]'],
+  grokSend: ['button[aria-label*="Send" i]', 'button[type="submit"]'],
+  grokInputArea: ['form'],
+  grokUserTurn: ['[data-testid="user-message"]', '[data-message-author-role="user"]'],
+  grokAssistantTurn: ['[data-testid="assistant-message"]', '[data-testid*="grok-message" i]', 'article'],
+  grokStopButton: ['button[aria-label*="Stop" i]', 'button[aria-label*="stop generating" i]'],
+  grokBusyIndicators: ['[aria-busy="true"]', '[role="progressbar"]'],
+  grokErrorToast: ['[role="alert"]'],
+
+  // --- ChatGPT (chatgpt.com) — ALL [unverified] ---
+  chatgptEditor: ['#prompt-textarea', 'textarea#prompt-textarea', '[contenteditable="true"]'],
+  chatgptSend: ['button[data-testid="send-button"]', 'button[aria-label*="Send" i]'],
+  chatgptInputArea: ['form'],
+  chatgptUserTurn: ['div[data-message-author-role="user"]'],
+  chatgptAssistantTurn: ['div[data-message-author-role="assistant"]'],
+  chatgptStopButton: ['button[data-testid="stop-button"]', 'button[aria-label*="Stop" i]'],
+  chatgptBusyIndicators: ['[aria-busy="true"]', '[role="progressbar"]'],
+  chatgptErrorToast: ['[role="alert"]'],
 };
 
 /** Text fragments the adapter may match on (model names only in English). */
@@ -121,4 +153,28 @@ export const SELECTOR_VERIFICATION = {
   errorToast: 'unverified',
   signInLink: 'unverified',
   permissionDialog: 'unverified',
+  museEditor: 'unverified',
+  museSend: 'unverified',
+  museInputArea: 'unverified',
+  museUserTurn: 'unverified',
+  museAssistantTurn: 'unverified',
+  museStopButton: 'unverified',
+  museBusyIndicators: 'unverified',
+  museErrorToast: 'unverified',
+  grokEditor: 'unverified',
+  grokSend: 'unverified',
+  grokInputArea: 'unverified',
+  grokUserTurn: 'unverified',
+  grokAssistantTurn: 'unverified',
+  grokStopButton: 'unverified',
+  grokBusyIndicators: 'unverified',
+  grokErrorToast: 'unverified',
+  chatgptEditor: 'unverified',
+  chatgptSend: 'unverified',
+  chatgptInputArea: 'unverified',
+  chatgptUserTurn: 'unverified',
+  chatgptAssistantTurn: 'unverified',
+  chatgptStopButton: 'unverified',
+  chatgptBusyIndicators: 'unverified',
+  chatgptErrorToast: 'unverified',
 };

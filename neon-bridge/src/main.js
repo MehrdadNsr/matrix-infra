@@ -12,6 +12,7 @@
 import { classifyError, isStopKind } from './core/errors.js';
 import { extractFinalFile } from './core/extract.js';
 import {
+  CHAT_IDLE_POLL_MS,
   HEARTBEAT_INTERVAL_MS,
   backoffMs,
   dailyCapReached,
@@ -30,13 +31,16 @@ import {
   resolvePlan,
 } from './core/state.js';
 import { chooseMode, createMcpHealth, recordMcpFallback, recordMcpSuccess } from './core/modes.js';
+import { defaultCodeEnabled, nextWork } from './core/chat.js';
 import { buildGemMessage, buildMessage } from './core/message.js';
 import { NB2_VERSION } from './version.js';
 import { BackendClient, BridgeKeyInvalidError } from './backend/client.js';
-import { GeminiAdapter, GEMINI_USAGE_URL } from './adapters/gemini.js';
+import { ADAPTERS, effectiveAgentName, selectSite } from './adapters/index.js';
+import { GEMINI_USAGE_URL } from './adapters/gemini.js';
 import { createPanel, DEFAULT_SETTINGS } from './ui/panel.js';
 import { runPasteAttempt } from './modes/paste.js';
 import { runMcpAttempt } from './modes/mcp.js';
+import { runChatItem } from './modes/chat.js';
 
 const STORE_PREFIX = 'nb2-';
 const LOCK_KEY = 'nb2-lock';
@@ -100,6 +104,13 @@ export function loadSettings(store) {
     settings.mcpToolNames = settings.mcpToolNames.split(',').map((s) => s.trim()).filter(Boolean);
   }
   if (!Array.isArray(settings.mcpToolNames)) settings.mcpToolNames = [...DEFAULT_SETTINGS.mcpToolNames];
+  // allowedSenders is a list too.
+  if (typeof settings.allowedSenders === 'string') {
+    settings.allowedSenders = settings.allowedSenders.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  if (!Array.isArray(settings.allowedSenders) || !settings.allowedSenders.length) {
+    settings.allowedSenders = [...DEFAULT_SETTINGS.allowedSenders];
+  }
   if (!['auto', 'mcp', 'paste'].includes(settings.mode)) settings.mode = 'auto';
   for (const key of ['mcpPickupTimeoutSec', 'mcpTaskTimeoutMin']) {
     const n = Number(settings[key]);
@@ -172,7 +183,7 @@ async function fetchLinkedTexts(client, urls, log) {
   return out;
 }
 
-export function start() {
+export async function start() {
   const store = createStore();
   const settings = loadSettings(store);
   const state = restoreState(store);
@@ -180,14 +191,35 @@ export function start() {
     backendUrl: settings.backendUrl,
     bridgeKey: settings.bridgeKey,
   });
-  const adapter = new GeminiAdapter({ log: (m) => panel.log(m) });
+
+  // One tab = one worker, one site. The adapter is picked by
+  // hostname (gemini / muse / grok / chatgpt). On an unknown host
+  // the script was never meant to run: log and stop.
+  const site = selectSite(window.location.hostname, settings.museDomain);
+  if (!site) {
+    console.warn(`[nb2] no adapter for host ${window.location.hostname}; not starting`);
+    return;
+  }
+  const AdapterClass = ADAPTERS[site];
+  const adapter = new AdapterClass({ log: (m) => panel.log(m), museDomain: settings.museDomain });
+  const agent = effectiveAgentName(settings.agentName, site);
+  // Code cards exist only on Gemini so far: on muse/grok/chatgpt
+  // codeEnabled defaults to false unless the user turned it on.
+  const codeEnabled = settings.codeEnabled !== false && (defaultCodeEnabled(site) || store.get('codeEnabled', undefined) !== undefined);
+  const chatEnabled = settings.chatEnabled !== false;
+  // Show the effective value in the panel: on muse/grok/chatgpt the
+  // box starts unchecked until the user turns code on explicitly.
+  if (!codeEnabled) settings.codeEnabled = false;
   const lock = acquireLock(settings.workerId || 'default');
 
   let panel;
+  // Room name while a chat item is being processed (null otherwise);
+  // the mode line and heartbeat state show it.
+  let activeChatRoom = null;
   // Gem mode is ON when a gemUrl is set. It can fall back to normal
   // mode for this session if the Gem does not allow model/thinking
-  // selection (decided by the self-test probe at Start).
-  let gemModeActive = Boolean(settings.gemUrl);
+  // selection (decided by the self-test probe at Start). Gemini only.
+  let gemModeActive = Boolean(settings.gemUrl) && site === 'gemini';
 
   const log = (message) => {
     if (panel) panel.log(message);
@@ -210,8 +242,11 @@ export function start() {
    */
   async function sendHeartbeat(stateName) {
     // While running, the heartbeat state carries the current mode,
-    // e.g. "running:mcp" or "running:paste".
-    const name = stateName === 'running' ? `running:${effectiveMode().mode}` : stateName;
+    // e.g. "running:mcp", "running:paste", or "running:chat:<room>".
+    let name = stateName;
+    if (stateName === 'running') {
+      name = activeChatRoom ? `running:chat:${activeChatRoom}` : `running:${effectiveMode().mode}`;
+    }
     try {
       await client.heartbeat({
         worker: settings.workerId,
@@ -284,7 +319,11 @@ export function start() {
       await adapter.stepPause();
       const readBack = adapter.readSettings();
       const modelOk = !readBack.model || readBack.model === plan.model;
-      const thinkingViaMenu = await adapter.readThinkingViaMenu();
+      // Menu verification exists only on Gemini; other adapters
+      // report null thinking, which counts as OK (as before).
+      const thinkingViaMenu = typeof adapter.readThinkingViaMenu === 'function'
+        ? await adapter.readThinkingViaMenu()
+        : null;
       const thinking = thinkingViaMenu || readBack.thinking;
       const thinkingOk = !thinking || thinking === plan.thinking;
       if (modelOk && thinkingOk) return { ok: true, readBack };
@@ -310,6 +349,7 @@ export function start() {
   }
 
   function modeLineText() {
+    if (activeChatRoom) return `Mode: CHAT — ${activeChatRoom}`;
     const { mode, pasteUntil } = effectiveMode();
     if (mode === 'mcp') return 'Mode: MCP';
     if (pasteUntil) {
@@ -321,6 +361,55 @@ export function start() {
 
   function updateModeLine() {
     if (panel) panel.setMode(modeLineText());
+  }
+
+  function roomsLineText() {
+    const names = Object.values(state.rooms || {}).map((r) => r.roomName || r.roomId);
+    return names.length ? names.join(', ') : 'none';
+  }
+
+  function updateRooms() {
+    if (panel) panel.setRooms(roomsLineText());
+  }
+
+  /** Chat-mode context handed to src/modes/chat.js. */
+  const chatCtx = {
+    client,
+    adapter,
+    settings,
+    state,
+    agent,
+    agentName: agent,
+    log,
+    sleep,
+    isRunning: () => state.running,
+    persistState: () => persistState(store, state),
+    updateRooms,
+    setLastChat: (text) => {
+      state.lastChatItem = text;
+      persistState(store, state);
+      if (panel) panel.setLastChat(text);
+    },
+  };
+
+  /** Disabled tab: the adapter self-test failed (selectors missing). */
+  async function disableTab(message) {
+    state.running = false;
+    state.stoppedReason = message;
+    persistState(store, state);
+    if (panel) {
+      panel.setState(`Disabled: ${message}`);
+      panel.setRunning(false);
+    }
+    log(`DISABLED: ${message}`);
+    sendHeartbeat('disabled');
+    if (settings.alertOnStop) {
+      try {
+        await client.notifyOwner('selectors', message);
+      } catch (err) {
+        log(`owner notification failed: ${err.message}`);
+      }
+    }
   }
 
   /** Send the message, handling the bounce-back symptom once. */
@@ -617,11 +706,59 @@ export function start() {
         }
 
         updateModeLine();
+
+        // Chat first: room items have priority over code cards, but
+        // never interrupt a card while the AI is generating — room_poll
+        // only runs here, between cards, and runChatItem re-checks
+        // adapter.isGenerating() before every send.
+        let chatItem = null;
+        if (chatEnabled) {
+          try {
+            const res = await client.roomPoll(settings.workerId, agent);
+            chatItem = res && res.item ? res.item : null;
+          } catch (err) {
+            log(`room_poll failed: ${err.message}`);
+          }
+        }
+        if (chatItem) {
+          const work = nextWork({ chatEnabled, codeEnabled, hasChatItem: true, hasCard: false });
+          if (work === 'chat') {
+            activeChatRoom = chatItem.room_name || chatItem.room_id;
+            updateModeLine();
+            sendHeartbeat('running');
+            const outcome = await runChatItem(chatCtx, chatItem);
+            activeChatRoom = null;
+            updateModeLine();
+            if (outcome === 'navigating') {
+              // The page is reloading into the room's chat; resume
+              // on load. Hanging here keeps the loop from clearing
+              // the persisted resume state before the unload.
+              await hangForever();
+              return;
+            }
+            if (outcome === 'deferred') {
+              // AI is generating: leave the item queued and fall
+              // through to the code card path below.
+            } else {
+              // Chat pacing: random 5-20 s, counts toward the cap.
+              const chatPace = settings.dryRun ? 2 : randomPaceSec(5, 20);
+              if (panel) panel.setState(`Chat pacing ${chatPace}s…`);
+              await sleep(chatPace * 1000);
+              continue;
+            }
+          }
+        }
+
+        if (!codeEnabled) {
+          if (panel) panel.setState('Chat only — polling');
+          await sleep(CHAT_IDLE_POLL_MS);
+          continue;
+        }
         const next = await client.next(settings.workerId);
         const card = chooseNextCard(next);
         if (!card) {
           if (panel) panel.setState('Queue empty — polling');
-          await sleep(idlePollSec() * 1000);
+          await sleep((chatEnabled ? CHAT_IDLE_POLL_MS : idlePollSec()) * 1000);
           continue;
         }
 
@@ -677,10 +814,12 @@ export function start() {
         if (panel) panel.setState('Idle — another tab is running this worker');
         return;
       }
-      // Startup self-test before any work.
+      // Startup self-test before any work. A failure runs this tab
+      // "disabled" (heartbeat + owner alert kind "selectors") —
+      // never guess silently with broken selectors.
       const test = adapter.selfTest();
       if (!test.ok) {
-        await fullStop('selectors', `self-test failed, missing: ${test.missing.join(', ')}`);
+        await disableTab(`self-test failed, missing: ${test.missing.join(', ')}`);
         return;
       }
       // Gem mode: confirm model + thinking can still be selected
@@ -716,12 +855,28 @@ export function start() {
       log('paused');
       sendHeartbeat('paused');
     },
+    onLeaveAllRooms: async () => {
+      const rooms = Object.values(state.rooms || {});
+      for (const room of rooms) {
+        try {
+          await client.roomPresence(agent, room.roomId, 'offline');
+        } catch (err) {
+          log(`room_presence offline failed (${room.roomId}): ${err.message}`);
+        }
+      }
+      state.rooms = {};
+      state.pendingChat = null;
+      persistState(store, state);
+      updateRooms();
+      if (panel) panel.setLastChat('Left all rooms');
+      log(`left ${rooms.length} room(s)`);
+    },
     onSelfTest: async () => {
       const test = adapter.selfTest();
       log(test.ok ? 'self-test OK: editor, send, model picker found' :
         `self-test FAILED, missing: ${test.missing.join(', ')}`);
       if (panel) panel.setState(test.ok ? 'Self-test OK' : `Self-test failed: ${test.missing.join(', ')}`);
-      if (test.ok && gemModeActive) {
+      if (test.ok && gemModeActive && site === 'gemini') {
         const probe = await adapter.probeModelControls();
         if (!probe.modelSelectable || !probe.thinkingSelectable) {
           log(`Gem probe FAILED (model: ${probe.modelSelectable}, thinking: ${probe.thinkingSelectable}); falling back to normal mode`);
@@ -741,6 +896,10 @@ export function start() {
   panel.setRunning(state.running);
   panel.setQuota(state.quotaPct);
   panel.setBlocked(state.blockedCount || 0, state.latestQuestion || '');
+  panel.setSite(`${site} (${window.location.hostname})`);
+  panel.setAgent(agent);
+  updateRooms();
+  panel.setLastChat(state.lastChatItem || '');
   updateModeLine();
   panel.setState(
     state.stoppedReason ? `Stopped: ${state.stoppedReason}` :
@@ -787,8 +946,8 @@ export function start() {
     },
   });
 
-  // Best-effort quota read when landing on the usage page.
-  if (window.location.href.startsWith(GEMINI_USAGE_URL)) {
+  // Best-effort quota read when landing on the usage page (Gemini only).
+  if (site === 'gemini' && window.location.href.startsWith(GEMINI_USAGE_URL)) {
     const pct = adapter.readQuotaFromUsagePage();
     if (pct != null) {
       state.quotaPct = pct;
@@ -800,10 +959,26 @@ export function start() {
     }
   }
 
-  // Resume automatically if the page reloaded mid-card while running.
-  if (state.running && lock.held && state.pending && state.pending.card) {
-    panel.setRunning(true);
-    loop();
+  // Resume automatically if the page reloaded mid-card / mid-chat-item
+  // while running. A failed self-test disables the tab instead.
+  if (state.running && lock.held) {
+    if (state.pendingChat && state.pendingChat.item) {
+      const test = adapter.selfTest();
+      if (!test.ok) {
+        await disableTab(`self-test failed, missing: ${test.missing.join(', ')}`);
+        return;
+      }
+      panel.setRunning(true);
+      const outcome = await runChatItem(chatCtx, state.pendingChat.item);
+      if (outcome === 'navigating') {
+        await hangForever();
+        return;
+      }
+    }
+    if (state.pending && state.pending.card) {
+      panel.setRunning(true);
+      loop();
+    }
   }
 }
 

@@ -185,6 +185,32 @@ export class BackendClient {
     return res.id ? res : null;
   }
 
+  /* --- Chat mode (group-chat relay) --- */
+
+  /**
+   * Poll for the next chat item for this agent. Returns {ok, item}
+   * or {ok, item: null} when there is nothing to do. item.type is
+   * "message" | "summon" | "dismiss".
+   */
+  roomPoll(worker, agent) {
+    return this.call('room_poll', { worker, agent });
+  }
+
+  /** Post a reply into the room as this agent. */
+  roomReply(id, text, chatUrl) {
+    return this.call('room_reply', { id, text, chat_url: chatUrl || null });
+  }
+
+  /** Report progress on a chat item: working | failed | skipped. */
+  roomStatus(id, status, error) {
+    return this.call('room_status', { id, status, error: error || null });
+  }
+
+  /** Presence for a room: online | offline. */
+  roomPresence(agent, roomId, state) {
+    return this.call('room_presence', { agent, room_id: roomId, state });
+  }
+
   /**
    * Owner notification. Kinds: "stopped" | "selectors" | "account"
    * (full stops) and "permission" (an unknown permission prompt was
