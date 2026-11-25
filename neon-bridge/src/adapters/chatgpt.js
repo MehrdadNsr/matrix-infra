@@ -16,7 +16,7 @@ import {
   firstMatch,
   firstMatches,
   insertIntoEditor,
-  pageErrorText as domPageErrorText,
+  domPageErrorText,
   sendViaSelectors,
   startPermissionWatcher as startWatcher,
   visible,
