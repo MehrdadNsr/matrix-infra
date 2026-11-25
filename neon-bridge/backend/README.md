@@ -23,9 +23,9 @@ the header `x-bridge-key: <bridgeKey>`.
 | `next` | `{action:"next", worker}` | `{ok, card \| null}` — `null` when the queue is empty |
 | `plan` | `{action:"plan", id}` | `{ok, settings:{model:"neon"\|"hydrogen", thinking:"low"\|"medium"\|"high", reason}}` |
 | `claim` | `{action:"claim", id, sent_hash}` | `200 {ok}`, or `409` when the same message was already sent (the script must not send it) |
-| `status` | `{action:"status", id, status:"waiting"\|"failed"\|"skipped"\|"queued", last_error?, model_used?, account_used?}` | `{ok}` |
+| `status` | `{action:"status", id, status:"waiting"\|"failed"\|"skipped"\|"queued", last_error?, model_used?, account_used?, mode_stats?}` | `{ok}` — `mode_stats` (on failure): `{mode_used, fell_back, fallback_reason, duration_s, permission_prompts, auto_approved, retries, ok}`. |
 | `supervise` | `{action:"supervise", id, messages:[{role:"user"\|"model", text}]}` | `{ok, verdict:{action:"accept"\|"continue"\|"retry"\|"escalate"\|"fail", message_indexes[], complete, needs_stitch, stale, reason}}` |
-| `submit` | `{action:"submit", id, content, model_used?, account_used?}` | `{ok, pr_url, commit}` |
+| `submit` | `{action:"submit", id, content, model_used?, account_used?, mode_stats?}` | `{ok, pr_url, commit}` — `mode_stats` (on success): `{mode_used, fell_back, fallback_reason, duration_s, permission_prompts, auto_approved, retries, ok}`. |
 | `ask` | `{action:"ask", id, question, chat_url}` | `{ok}` — the card becomes status `blocked`; the backend routes the question to the agent that created the card (escalating to a senior agent if needed). The script does nothing else here and never waits for the answer. |
 | `heartbeat` | `{action:"heartbeat", worker, state, card_id?, quota_pct?, last_error?, version, last_auto_approval?}` — `state` is `running` \| `paused` \| `stopped` \| `idle`; `last_auto_approval` is e.g. `"auto-approved read_file for neon-mcp"` | `{ok}` — lets other agents see whether the bridge is alive. Sent every 60 s and on every state change. |
 | `alert` | `{action:"alert", kind:"stopped"\|"selectors"\|"account"\|"permission", message}` | `{ok}` — the backend emails the owner (rate-limited server-side). Kind `"permission"` means an unknown permission prompt appeared and was left alone; the worker paused instead of approving. The message is the prompt text, capped at 300 chars. |
@@ -52,7 +52,10 @@ the header `x-bridge-key: <bridgeKey>`.
   "attempts": 0,
   "last_error": null,
   "only_neon": false,
-  "status": "queued"
+  "status": "queued",
+  "read_url": "https://read.example.com/task/card-uuid",
+  "mode_hint": "mcp-first",
+  "mcp_active": true
 }
 ```
 
@@ -66,6 +69,12 @@ Notes:
 - `supervise` may return verdict action `"ask"` with a `question`
   field when the model asked a QUESTION or the task is too ambiguous.
   `ask` is a first-class verdict, not an error.
+- `read_url` is the link the AI reads in the link flow
+  (`read.trafactor.com/…`); when it is missing the script pastes
+  the card text instead. `mode_hint` overrides the worker's
+  strategy for that card (`paste-first` | `mcp-first` | `ab` |
+  `paste-only` | `mcp-only`). `mcp_active: false` makes MCP mode
+  fall back to the link flow immediately.
 - `message_indexes` in a verdict refer to the `messages` array sent
   in that same `supervise` call, in order.
 ### Chat item object (`room_poll`)

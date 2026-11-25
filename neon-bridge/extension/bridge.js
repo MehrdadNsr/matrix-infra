@@ -927,6 +927,31 @@ function roomIntroWithSummary({ agentDisplayName, roomName, members = [], maxWor
   );
 }
 
+/* --- Link flow (paste mode) --- */
+
+/**
+ * Message for the link flow: the card's read link plus a short
+ * instruction block. When the card has no read_url, fall back to
+ * pasting the card text (the full prompt + footer).
+ */
+function linkMessage(card, attempt = 1) {
+  if (card.read_url) {
+    return (
+      `${introForAttempt(attempt)}\n\n` +
+      `Read the task here: ${card.read_url}\n\n` +
+      `Read it, then write the complete file. Reply with exactly one fenced code block containing the whole file, and end with END-${card.id}.\n` +
+      `If anything in the task is unclear or contradicts the repo, do NOT guess — output only a block starting with the line QUESTION ${card.id}, list the questions, end with END-${card.id}, and stop.`
+    );
+  }
+  return buildMessage(card, attempt);
+}
+
+/** Gem mode variant of the link message: CARD + link + one-line reminder. */
+function linkGemMessage(card) {
+  const body = card.read_url ? `Read the task here: ${card.read_url}` : card.prompt;
+  return `CARD ${card.id}\n${body}\nFollow your rules. End with END-${card.id}.`;
+}
+
 
 // ---- src/core/permission.js ----
 // Permission-prompt classification — pure logic, no DOM.
@@ -997,18 +1022,26 @@ function truncatePromptText(text, max = MAX_PROMPT_TEXT_CHARS) {
 
 
 // ---- src/core/modes.js ----
-// Mode choice + MCP health — pure logic, no DOM.
+// Code-mode strategy + MCP health + per-card mode stats — pure logic.
 //
-// Each card runs in one mode: MCP first (Gemini works through the
-// neon-mcp tools and delivers with submit_file), paste as the
-// fallback (send the prompt in the chat, supervise, extract, submit).
-// Settings.mode is "auto" | "mcp" | "paste" (default "auto").
-// Answered cards always run in paste mode: their answer is delivered
-// as chat text, which is a paste-mode interaction.
+// Two code modes exist: MCP (Gemini works through the neon-mcp tools
+// and delivers with submit_file) and LINK (the AI gets a read link,
+// reads the task, writes the code; the script copies the answer and
+// submits it). Which runs first is the strategy:
+//   "paste-first" (default), "mcp-first", "ab", "paste-only", "mcp-only"
+// "ab" alternates per card (odd seq MCP-first, even seq LINK-first)
+// so both methods get comparable data. During the test period, Gemini
+// defaults to "ab" when the testMode setting is on. A backend card
+// may override the strategy for that card with card.mode_hint.
+// Answered cards always run in LINK mode: their answer is delivered
+// as chat text.
+//
+// MCP health (unchanged): after 2 consecutive MCP fallbacks the
+// worker uses LINK for 30 minutes, then tries MCP again.
 
-const MODE_SETTING_VALUES = Object.freeze(['auto', 'mcp', 'paste']);
+const MODE_STRATEGIES = Object.freeze(['paste-first', 'mcp-first', 'ab', 'paste-only', 'mcp-only']);
 const MCP_FALLBACKS_BEFORE_PASTE = 2; // consecutive fallbacks
-const MCP_HEALTH_WINDOW_MS = 30 * 60 * 1000; // paste for 30 min
+const MCP_HEALTH_WINDOW_MS = 30 * 60 * 1000; // link for 30 min
 
 /** Fresh MCP health (persisted in the worker state). */
 function createMcpHealth() {
@@ -1016,26 +1049,56 @@ function createMcpHealth() {
 }
 
 /**
- * Decide the mode for a card.
- * Input: { modeSetting, health, card, now }.
- * health is { consecutiveFallbacks, pasteUntil } (ms epoch, 0 = none).
- * - answered cards -> paste (the answer is chat text)
- * - mode "paste" -> paste, always; mode "mcp" -> mcp, always
- * - auto -> paste while inside the health window, else mcp
+ * Effective strategy for this tab. An explicitly set modeStrategy
+ * wins; otherwise Gemini defaults to "ab" during the test period
+ * (testMode on), and everything else defaults to "paste-first".
+ * `explicit` is true when the user ever saved modeStrategy.
  */
-function chooseMode({ modeSetting, health, card, now }) {
-  const setting = MODE_SETTING_VALUES.includes(modeSetting) ? modeSetting : 'auto';
-  if (card && card.status === 'answered') return 'paste';
-  if (setting === 'paste') return 'paste';
-  if (setting === 'mcp') return 'mcp';
+function resolveModeStrategy({ setting, explicit, testMode, site }) {
+  if (explicit && MODE_STRATEGIES.includes(setting)) return setting;
+  if (testMode && site === 'gemini') return 'ab';
+  return 'paste-first';
+}
+
+/** A backend card may override the strategy with card.mode_hint. */
+function resolveCardStrategy({ strategy, card }) {
+  const hint = card && card.mode_hint;
+  if (hint && MODE_STRATEGIES.includes(hint)) return hint;
+  return strategy;
+}
+
+/**
+ * First mode for a card under a strategy. The MCP-health window
+ * forces LINK first (except for mcp-only, which never falls back).
+ * Answered cards always run in LINK mode.
+ */
+function firstModeForCard({ strategy, card, health, now = Date.now() }) {
+  if (card && card.status === 'answered') return 'link';
   const h = health || createMcpHealth();
-  if (h.pasteUntil && now < h.pasteUntil) return 'paste';
-  return 'mcp';
+  const inWindow = h.pasteUntil && now < h.pasteUntil;
+  if (strategy === 'mcp-only') return 'mcp';
+  if (strategy === 'paste-only') return 'link';
+  if (inWindow) return 'link';
+  if (strategy === 'mcp-first') return 'mcp';
+  if (strategy === 'ab') return (card && (card.seq ?? 0) % 2 === 1) ? 'mcp' : 'link';
+  return 'link'; // paste-first (and anything unknown)
+}
+
+/** May this strategy fall back from `from` to the other mode? */
+function canFallback({ strategy, from }) {
+  if (strategy === 'mcp-only' || strategy === 'paste-only') return false;
+  return from === 'mcp' || from === 'link';
+}
+
+/** First mode for the panel / heartbeat when no card is in flight. */
+function displayFirstMode({ strategy, health, now = Date.now() }) {
+  if (strategy === 'ab') return 'ab';
+  return firstModeForCard({ strategy, card: { status: 'queued', seq: 0 }, health, now });
 }
 
 /**
  * After an MCP fallback: one more consecutive fallback. The second
- * consecutive fallback opens a 30-minute paste window, then MCP is
+ * consecutive fallback opens a 30-minute LINK window, then MCP is
  * tried again on the next card. Returns the new health.
  */
 function recordMcpFallback(health, now) {
@@ -1050,10 +1113,73 @@ function recordMcpFallback(health, now) {
 /**
  * After MCP demonstrably worked (done, blocked via tools, or a
  * backend "failed" status — the tools ran, the task itself failed):
- * the fallback streak resets and any paste window closes.
+ * the fallback streak resets and any LINK window closes.
  */
 function recordMcpSuccess(health) {
   return { consecutiveFallbacks: 0, pasteUntil: 0 };
+}
+
+/* --- Per-card mode stats (mode_stats) --- */
+
+/** Fresh per-card stats, sent with submit and on failure via status. */
+function createModeStats() {
+  return {
+    mode_used: '',
+    fell_back: false,
+    fallback_reason: '',
+    duration_s: 0,
+    permission_prompts: 0, // prompts the watcher saw on this card
+    auto_approved: 0, // of those, the ones auto-approved
+    retries: 0, // extra attempts after the first
+    ok: false,
+  };
+}
+
+/** Fresh per-mode counters (persisted in the worker state). */
+function createModeCounters() {
+  return {
+    mcp: { cards: 0, ok: 0, totalDurationS: 0, permissionPrompts: 0 },
+    link: { cards: 0, ok: 0, totalDurationS: 0, permissionPrompts: 0 },
+  };
+}
+
+/** Fold one card's stats into the counters. Returns new counters. */
+function recordModeStats(counters, stats) {
+  const c = counters || createModeCounters();
+  const mode = stats.mode_used === 'mcp' ? 'mcp' : 'link';
+  const prev = c[mode] || { cards: 0, ok: 0, totalDurationS: 0, permissionPrompts: 0 };
+  return {
+    ...c,
+    [mode]: {
+      cards: prev.cards + 1,
+      ok: prev.ok + (stats.ok ? 1 : 0),
+      totalDurationS: prev.totalDurationS + (stats.duration_s || 0),
+      permissionPrompts: prev.permissionPrompts + (stats.permission_prompts || 0),
+    },
+  };
+}
+
+/** One mode's counter line for the panel: "MCP 12 cards · 83% ok · avg 94s · avg 1.2 prompts". */
+function formatModeCounter(label, counter) {
+  const c = counter || { cards: 0, ok: 0, totalDurationS: 0, permissionPrompts: 0 };
+  if (!c.cards) return `${label} 0 cards`;
+  const okPct = Math.round((c.ok / c.cards) * 100);
+  const avgS = Math.round(c.totalDurationS / c.cards);
+  const avgPrompts = (c.permissionPrompts / c.cards).toFixed(1);
+  return `${label} ${c.cards} cards · ${okPct}% ok · avg ${avgS}s · avg ${avgPrompts} prompts`;
+}
+
+/**
+ * Whether the card may be submitted now. `fresh` is the re-read card
+ * (null when the backend does not provide the card action — then the
+ * caller proceeds, it cannot verify). Never submit the same card
+ * twice: an already-done card must not be submitted again.
+ */
+function decideSubmit(fresh) {
+  if (!fresh) return 'submit';
+  if (fresh.status === 'done') return 'already-done';
+  if (fresh.status === 'skipped' || fresh.status === 'failed') return 'cancelled';
+  return 'submit';
 }
 
 
@@ -1376,6 +1502,10 @@ function createWorkerState() {
     latestQuestion: '', // text of the most recent routed question
     lastAutoApproval: null, // e.g. "auto-approved read_file for neon-mcp"
     mcpHealth: { consecutiveFallbacks: 0, pasteUntil: 0 }, // MCP fallback streak + paste window (ms epoch)
+    modeStats: { // per-mode counters: { mcp: {cards, ok, totalDurationS, permissionPrompts}, link: {...} }
+      mcp: { cards: 0, ok: 0, totalDurationS: 0, permissionPrompts: 0 },
+      link: { cards: 0, ok: 0, totalDurationS: 0, permissionPrompts: 0 },
+    },
     rooms: {}, // chat rooms joined: { [roomId]: { roomId, roomName, chatUrl, turns, replyTimes, lastHumanTs } }
     pendingChat: null, // in-flight chat item, saved before navigation: { item, stage, expectedUrl?, summary? }
     lastChatItem: '', // one-line summary of the last chat item, shown in the panel
@@ -2985,9 +3115,10 @@ const DEFAULT_SETTINGS = Object.freeze({
   gemUrl: '', // optional: when set, Gem mode is ON (default OFF)
   mcpServerName: 'neon-mcp',
   mcpToolNames: ['repo_info', 'list_dir', 'read_file', 'get_task', 'submit_file', 'ask_question', 'report_status'],
-  mode: 'auto', // "auto" | "mcp" | "paste": which mode runs a card
+  modeStrategy: 'paste-first', // "paste-first" | "mcp-first" | "ab" | "paste-only" | "mcp-only": which code mode runs first
+  testMode: false, // when on, Gemini defaults to "ab" unless modeStrategy was set explicitly
   mcpPickupTimeoutSec: 90, // MCP: give up if no tool use seen in this long
-  mcpTaskTimeoutMin: 25, // MCP: give up if the task is not done in this long
+  mcpTimeoutMin: 6, // MCP: fall back to the link flow if no submit_file in this long
   agentName: '', // agent id for this tab; '' = the site default (gemini neon, muse muse, grok grok, chatgpt gpt)
   museDomain: 'muse.ai', // the Muse web app's domain (also needs @match / manifest to run there)
   codeEnabled: true, // code cards (MCP/paste); default false on muse/grok/gpt until their code flows exist
@@ -3072,9 +3203,13 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest, onLeaveAll
   quotaLine.id = 'nb2-quota';
   body.appendChild(quotaLine);
 
-  const modeLine = el('div', 'nb2-small', 'Mode: MCP');
+  const modeLine = el('div', 'nb2-small', 'Mode: LINK');
   modeLine.id = 'nb2-mode';
   body.appendChild(modeLine);
+
+  const strategyLine = el('div', 'nb2-small', 'Strategy: paste-first');
+  strategyLine.id = 'nb2-strategy';
+  body.appendChild(strategyLine);
 
   const blockedLine = el('div', 'nb2-small', 'Blocked (waiting for answer): 0');
   blockedLine.id = 'nb2-blocked';
@@ -3130,9 +3265,9 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest, onLeaveAll
     ['gemUrl', 'Gem URL (optional, Gem mode)', 'text'],
     ['mcpServerName', 'MCP server name (auto-approve)', 'text'],
     ['mcpToolNames', 'MCP tool names (comma-separated)', 'list'],
-    ['mode', 'Mode (auto / mcp / paste)', 'select', ['auto', 'mcp', 'paste']],
+    ['modeStrategy', 'Strategy (paste-first / mcp-first / ab / paste-only / mcp-only)', 'select', ['paste-first', 'mcp-first', 'ab', 'paste-only', 'mcp-only']],
     ['mcpPickupTimeoutSec', 'MCP pickup timeout (sec)', 'number'],
-    ['mcpTaskTimeoutMin', 'MCP task timeout (min)', 'number'],
+    ['mcpTimeoutMin', 'MCP timeout (min, then link fallback)', 'number'],
     ['agentName', 'Agent name (empty = site default)', 'text'],
     ['museDomain', 'Muse web app domain', 'text'],
     ['allowedSenders', 'Allowed senders (comma-separated)', 'list'],
@@ -3193,7 +3328,19 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest, onLeaveAll
   quietLabel.appendChild(quietRow);
   form.appendChild(quietLabel);
 
-  const codeLabel = el('label', '', 'Code cards (MCP / paste)');
+  const testLabel = el('label', '', 'Test mode (Gemini defaults to "ab" strategy)');
+  const testCheck = el('input');
+  testCheck.id = 'nb2-set-testMode';
+  testCheck.type = 'checkbox';
+  testCheck.checked = Boolean(settings.testMode);
+  testCheck.addEventListener('change', () => {
+    settings.testMode = testCheck.checked;
+    store.set('testMode', testCheck.checked);
+  });
+  testLabel.prepend(testCheck);
+  form.appendChild(testLabel);
+
+  const codeLabel = el('label', '', 'Code cards (MCP / link)');
   const codeCheck = el('input');
   codeCheck.id = 'nb2-set-codeEnabled';
   codeCheck.type = 'checkbox';
@@ -3279,6 +3426,9 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest, onLeaveAll
     setMode(text) {
       modeLine.textContent = text;
     },
+    setStrategy(text) {
+      strategyLine.textContent = text;
+    },
     setQuota(pct) {
       quotaLine.textContent = pct == null ? 'Quota: unknown' : `Quota remaining: ${pct}%`;
     },
@@ -3306,30 +3456,32 @@ function createPanel({ store, settings, onStart, onPause, onSelfTest, onLeaveAll
 }
 
 
-// ---- src/modes/paste.js ----
-// Paste mode — the original flow, moved here unchanged in behaviour:
-// send the prompt in the chat, wait for the answer, supervise it,
-// extract the code and submit. One attempt per call; the caller
-// (main.js) owns the attempt loop, the new-chat navigation, the
-// health check and the settings application.
+// ---- src/modes/link.js ----
+// Link flow (paste mode) — the AI gets a read link, reads the task,
+// writes the code; the script copies the answer and submits it.
+// One attempt per call; the caller (main.js) owns the attempt loop,
+// the new-chat navigation, the health check and the settings
+// application. No supervisor: the instruction asks for exactly one
+// fenced code block ending with END-<id>; a cut-off answer gets up
+// to 3 same-chat "Continue" turns, then the extracted code is
+// submitted (or the attempt retries in a new chat when nothing was
+// extracted). When the card has no read_url, the card text is pasted
+// instead (see linkMessage in core/message.js).
 //
-// `ctx` (built by main.js) carries the shared wiring: client,
-// adapter, settings, state, panel, log, sleep, hangForever,
-// newChatTarget, applySettings, sendWithBounceRetry, failCard,
-// submitCard, checkCardActive, fetchLinkedTexts, buildTaskMessage,
-// gemModeActive, isRunning, updatePending, persistState, clearPending.
-// `s` is the attempt state (persisted in pending across navigations):
-// card, plan, model, thinking, attempt, maxAttempts, continues,
-// linksInlined, isAnswered, questions, answeredStage, promptResent,
-// answerSent, answerContext, lastQuestion, mode, mcp.
+// `ctx` and `s` are the same shapes paste.js used (see its header
+// before it was replaced): client, adapter, settings, state, panel,
+// log, sleep, hangForever, newChatTarget, applySettings,
+// sendWithBounceRetry, failCard, submitCard, checkCardActive,
+// fetchLinkedTexts, buildTaskMessage, buildLinkMessage, gemModeActive,
+// isRunning, updatePending, persistState, clearPending.
 //
-// Returns { outcome, reason? } where outcome is 'done' | 'failed' |
+// Returns { outcome } where outcome is 'done' | 'failed' |
 // 'skipped' | 'blocked' | 'retry' | 'escalate'. Terminal failures
-// call ctx.failCard themselves, exactly as the flow did before the
-// split; 'retry' / 'escalate' mean "next attempt in a new chat".
+// call ctx.failCard themselves; 'retry' / 'escalate' mean "next
+// attempt in a new chat". The caller attaches mode_stats.
 
 
-async function runPasteAttempt(ctx, s) {
+async function runLinkAttempt(ctx, s) {
   const { card } = s;
   const model = s.model;
 
@@ -3337,7 +3489,7 @@ async function runPasteAttempt(ctx, s) {
   // questions. In the fallback case the saved chat is gone, so the
   // original prompt goes first to re-establish context.
   if (s.isAnswered && s.answeredStage === 'fallback-ready' && !s.promptResent) {
-    const promptTurn = ctx.buildTaskMessage(card, s.attempt);
+    const promptTurn = ctx.buildLinkMessage(card, s.attempt);
     const ok = await ctx.adapter.insertText(promptTurn) &&
       (await ctx.sendWithBounceRetry(promptTurn)).sent;
     if (!ok) {
@@ -3361,23 +3513,13 @@ async function runPasteAttempt(ctx, s) {
   } else if (s.answerContext) {
     // Later attempts keep the Q&A so the model is not asked
     // the same questions again in a fresh chat.
-    message = `${ctx.buildTaskMessage(card, s.attempt)}\n\n${s.answerContext}`;
+    message = `${ctx.buildLinkMessage(card, s.attempt)}\n\n${s.answerContext}`;
   } else {
-    message = ctx.buildTaskMessage(card, s.attempt);
-  }
-  if (!sendingAnswer && s.linksInlined && card.read_links && card.read_links.length) {
-    if (ctx.gemModeActive) {
-      // Gem mode: the Gem's instructions own the links; the full
-      // footer (and its inline-links form) is never sent there.
-      ctx.log('Gem mode: skipping inline-links retry');
-    } else {
-      const texts = await ctx.fetchLinkedTexts(card.read_links);
-      message = buildMessageWithLinks(card, texts, s.attempt);
-    }
+    message = ctx.buildLinkMessage(card, s.attempt);
   }
 
   if (ctx.settings.dryRun) {
-    ctx.log(`[dry run] would send ${message.length} chars to ${model}/${s.thinking}, then supervise + submit`);
+    ctx.log(`[dry run] would send link message (${message.length} chars) to ${model}/${s.thinking}, then extract + submit`);
     ctx.clearPending();
     return { outcome: 'done' };
   }
@@ -3433,110 +3575,100 @@ async function runPasteAttempt(ctx, s) {
   }
   if (completion.timedOut) ctx.log('generation timed out after 10 min');
 
-  // Supervise, with same-chat continues inside this attempt.
+  // Cut-off answer: same-chat "Continue" turns, up to MAX_CONTINUES.
   let messages = ctx.adapter.readMessages(5);
   while (true) {
     const lastModel = [...messages].reverse().find((m) => m.role === 'model');
     if (lastModel && isCutOff(lastModel.text, card.id)) {
-      ctx.log('answer looks cut off (no END marker / unclosed fence); supervisor decides');
+      if (s.continues >= MAX_CONTINUES) break;
+      ctx.log('answer looks cut off (no END marker / unclosed fence); asking to continue');
+      s.continues += 1;
+      ctx.updatePending({
+        attempt: s.attempt, continues: s.continues, thinking: s.thinking,
+        model, linksInlined: s.linksInlined,
+      });
+      await ctx.adapter.insertText(continueMessage(card.id));
+      await ctx.adapter.send();
+      await ctx.client.setStatus(card.id, { status: 'waiting', model_used: model });
+      await ctx.adapter.waitForCompletion();
+      messages = ctx.adapter.readMessages(5);
+      continue;
     }
-    const sup = await ctx.client.supervise(card.id, messages);
-    let verdict = sup.verdict || {};
-    // The model may ask a QUESTION block even when the supervisor
-    // did not label it 'ask' — a detected QUESTION block wins.
-    const detected = lastModel ? detectQuestion(lastModel.text, card.id) : null;
-    if (verdict.action !== 'ask' && detected) {
-      verdict = { action: 'ask', question: detected.question };
-    }
-    const problem = verdictProblem(verdict);
-    if (problem) {
-      await ctx.failCard(card, model, `bad verdict: ${problem}`);
-      return { outcome: 'failed' };
-    }
-    ctx.log(`supervisor: ${verdict.action} — ${verdict.reason || ''}${verdict.stale ? ' (stale echo)' : ''}`);
-
-    // Ask is a first-class state, not an error: route the question
-    // to the backend (the card becomes "blocked" there), show it
-    // in the panel, and move on to the next card. Never wait here.
-    if (verdict.action === 'ask') {
-      const askRec = recordAsk({ attempt: s.attempt, questions: s.questions });
-      if (askRec.action === 'fail') {
-        await ctx.failCard(card, model, 'too many questions');
-        return { outcome: 'failed' };
-      }
-      const question = verdict.question || detected?.question || verdict.reason || 'No question text received';
-      await ctx.client.ask(card.id, question, window.location.href);
-      s.questions = askRec.questions;
-      ctx.state.blockedCount = (ctx.state.blockedCount || 0) + 1;
-      ctx.state.latestQuestion = question;
-      ctx.updatePending({ attempt: askRec.attempt, questions: s.questions, lastQuestion: question });
-      if (ctx.panel) ctx.panel.setBlocked(ctx.state.blockedCount, ctx.state.latestQuestion);
-      ctx.log(`question routed (round ${s.questions}/${MAX_QUESTIONS}): ${question}`);
-      return { outcome: 'blocked' };
-    }
-
-    // Links not read: one retry with the linked text pasted inline.
-    if (verdict.action === 'retry' && !s.linksInlined &&
-        classifyError(verdict.reason || '').kind === 'links_not_read' &&
-        card.read_links && card.read_links.length) {
-      s.linksInlined = true;
-      ctx.log('supervisor says links were not read; retrying with linked text inline');
-      return { outcome: 'retry' };
-    }
-
-    const decision = decideAfterVerdict({
-      verdict, attempt: s.attempt, maxAttempts: s.maxAttempts,
-      continues: s.continues, thinking: s.thinking,
-    });
-    if (decision.action === 'submit') {
-      const res = await ctx.submitCard(card, model, messages, verdict);
-      return { outcome: res }; // 'done' | 'failed' | 'skipped'
-    }
-    if (decision.action === 'fail') {
-      await ctx.failCard(card, model, decision.note || verdict.reason || 'failed');
-      return { outcome: 'failed' };
-    }
-    if (decision.action === 'escalate') {
-      s.thinking = decision.thinking;
-      ctx.log(`escalating thinking to ${s.thinking}`);
-      return { outcome: 'escalate' };
-    }
-    if (decision.action === 'retry') return { outcome: 'retry' };
-    // decision.action === 'continue': same chat, one more turn.
-    if (s.continues >= MAX_CONTINUES) {
-      await ctx.failCard(card, model, 'max continues reached');
-      return { outcome: 'failed' };
-    }
-    s.continues += 1;
-    ctx.updatePending({
-      attempt: s.attempt, continues: s.continues, thinking: s.thinking,
-      model, linksInlined: s.linksInlined,
-    });
-    await ctx.adapter.insertText(continueMessage(card.id));
-    await ctx.adapter.send();
-    await ctx.client.setStatus(card.id, { status: 'waiting', model_used: model });
-    await ctx.adapter.waitForCompletion();
-    messages = ctx.adapter.readMessages(5);
-    // Loop: supervise the now-longer history.
+    break;
   }
+
+  // A QUESTION block is a first-class state, not an error: route it
+  // to the backend (the card becomes "blocked" there) and move on.
+  const lastModel = [...messages].reverse().find((m) => m.role === 'model');
+  const detected = lastModel ? detectQuestion(lastModel.text, card.id) : null;
+  if (detected) {
+    const askRec = recordAsk({ attempt: s.attempt, questions: s.questions });
+    if (askRec.action === 'fail') {
+      await ctx.failCard(card, model, 'too many questions');
+      return { outcome: 'failed' };
+    }
+    await ctx.client.ask(card.id, detected.question, window.location.href);
+    s.questions = askRec.questions;
+    ctx.state.blockedCount = (ctx.state.blockedCount || 0) + 1;
+    ctx.state.latestQuestion = detected.question;
+    ctx.updatePending({ attempt: askRec.attempt, questions: s.questions, lastQuestion: detected.question });
+    if (ctx.panel) ctx.panel.setBlocked(ctx.state.blockedCount, ctx.state.latestQuestion);
+    ctx.log(`question routed (round ${s.questions}/${MAX_QUESTIONS}): ${detected.question}`);
+    return { outcome: 'blocked' };
+  }
+
+  // Extract the file from all model messages (no supervisor in the
+  // link flow — the instruction asks for exactly one code block).
+  // submitCard re-reads the card first and never submits a card
+  // that is already done.
+  const indexes = messages.map((m, i) => i);
+  const content = extractFinalFile(messages, indexes, card.id);
+  if (!content) {
+    ctx.log('no code extracted from the link-flow answer; retrying in a new chat');
+    return { outcome: 'retry' };
+  }
+  const res = await ctx.submitCard(card, model, messages, { message_indexes: indexes });
+  return { outcome: res }; // 'done' | 'failed' | 'skipped'
 }
 
 
 // ---- src/modes/mcp.js ----
 // MCP mode — Gemini works through the neon-mcp tools and delivers
 // the file with submit_file; the script polls the backend until the
-// card is done, blocked or failed, and only falls back to paste mode
-// on a pickup timeout, a "no tools" reply, or a task timeout.
+// card is done, blocked or failed, and only falls back to the link
+// flow on a pickup timeout, a "no tools" reply, a task timeout, MCP
+// not being active, more than 3 permission prompts on one card, or
+// an MCP tool error twice.
 //
 // The poll decision (mcpPollDecision) is pure and unit-tested; the
 // wiring below (send + poll loop) is thin. `ctx` and `s` are the same
-// shapes paste.js uses (see its header). `s.mcp` is
-// { startedAt, nudged, seen, sent, lastText, lastTextAt } — persisted
-// in pending so a reload resumes polling instead of re-sending.
+// shapes link.js uses (see its header). `s.mcp` is
+// { startedAt, nudged, seen, sent, lastText, lastTextAt, toolErrors,
+//   lastToolError } — persisted in pending so a reload resumes
+// polling instead of re-sending.
 
 
 const MCP_POLL_MS = 10000;
 const REPLY_STABLE_MS = 8000; // reply text unchanged this long = finished
+const MCP_MAX_PERMISSION_PROMPTS = 3; // more than this on one card -> fallback
+const MCP_MAX_TOOL_ERRORS = 2; // this many distinct tool errors -> fallback
+
+/**
+ * True when the reply text reports an MCP tool error (the tool call
+ * itself failed, e.g. submit_file / get_task errored). English and
+ * Persian. Used to count distinct tool errors across the attempt.
+ */
+function detectMcpToolError(text) {
+  const t = String(text || '');
+  if (!t) return false;
+  return (
+    /(submit_file|get_task|read_file|list_dir|repo_info|ask_question|report_status)\s+(failed|error|errored)/i.test(t) ||
+    /tool\s+(error|failed)/i.test(t) ||
+    /mcp\s+(tool\s+)?(error|failed)/i.test(t) ||
+    /خطا(ی)?\s*(ابزار|mcp)/.test(t) ||
+    /(ابزار|mcp)\s*.*خطا/.test(t)
+  );
+}
 
 /**
  * Pure poll decision. Input:
@@ -3547,12 +3679,14 @@ const REPLY_STABLE_MS = 8000; // reply text unchanged this long = finished
  *  elapsedMs, pickupTimeoutMs, taskTimeoutMs
  *  replyFinished: the reply ended (stop button gone, text stable)
  *  replyText: the last model turn, thinking removed
+ *  toolErrors: distinct MCP tool errors seen so far on this card
+ *  permissionPrompts: permission prompts the watcher saw on this card
  * Returns { action, reason?, prUrl?, question?, seen } where action
  * is 'done' | 'blocked' | 'failed' | 'fallback' | 'nudge' | 'wait'.
  */
 function mcpPollDecision({
   card, seen, nudged, elapsedMs, pickupTimeoutMs, taskTimeoutMs,
-  replyFinished, replyText,
+  replyFinished, replyText, toolErrors = 0, permissionPrompts = 0,
 }) {
   if (!card) return { action: 'fallback', reason: 'backend does not provide card action', seen };
   if (card.status === 'done') {
@@ -3569,11 +3703,22 @@ function mcpPollDecision({
     return { action: 'failed', reason: card.last_error || 'MCP task failed', seen: seen || Boolean(card.mcp_seen_at) };
   }
   const seenNow = seen || Boolean(card.mcp_seen_at);
+  // MCP not active on this card (the backend says so): fall back
+  // immediately instead of waiting for a pickup that will not come.
+  if (card.mcp_active === false) {
+    return { action: 'fallback', reason: 'MCP is not active for this card', seen: seenNow };
+  }
   // A "no tools" reply is recognised immediately — no point waiting
   // for the pickup timeout when Gemini already said it cannot use
   // the tools.
   if (replyText && classifyError(replyText).kind === 'no_mcp_tools') {
     return { action: 'fallback', reason: 'Gemini reports no MCP tools', seen: seenNow };
+  }
+  if (toolErrors >= MCP_MAX_TOOL_ERRORS) {
+    return { action: 'fallback', reason: `MCP tool error ${toolErrors} times`, seen: seenNow };
+  }
+  if (permissionPrompts > MCP_MAX_PERMISSION_PROMPTS) {
+    return { action: 'fallback', reason: `more than ${MCP_MAX_PERMISSION_PROMPTS} permission prompts on one card`, seen: seenNow };
   }
   if (!seenNow && elapsedMs > pickupTimeoutMs) {
     return { action: 'fallback', reason: `no MCP pickup in ${Math.round(pickupTimeoutMs / 1000)}s`, seen: seenNow };
@@ -3601,7 +3746,7 @@ async function runMcpAttempt(ctx, s) {
   const settings = ctx.settings;
   const mcp = s.mcp || (s.mcp = {
     startedAt: Date.now(), nudged: false, seen: false, sent: false,
-    lastText: '', lastTextAt: 0,
+    lastText: '', lastTextAt: 0, toolErrors: 0, lastToolError: '',
   });
 
   if (!mcp.sent) {
@@ -3672,15 +3817,25 @@ async function runMcpAttempt(ctx, s) {
       mcp.lastText = gen.lastModelText;
       mcp.lastTextAt = Date.now();
     }
+    // Distinct MCP tool errors in the reply text: count a new one
+    // only when the text changed, so one persistent error is not
+    // counted on every poll.
+    if (gen.lastModelText && detectMcpToolError(gen.lastModelText) &&
+        gen.lastModelText !== mcp.lastToolError) {
+      mcp.toolErrors = (mcp.toolErrors || 0) + 1;
+      mcp.lastToolError = gen.lastModelText;
+    }
     const decision = mcpPollDecision({
       card: fresh,
       seen: mcp.seen,
       nudged: mcp.nudged,
       elapsedMs: Date.now() - mcp.startedAt,
       pickupTimeoutMs: settings.mcpPickupTimeoutSec * 1000,
-      taskTimeoutMs: settings.mcpTaskTimeoutMin * 60 * 1000,
+      taskTimeoutMs: (settings.mcpTimeoutMin || 6) * 60 * 1000,
       replyFinished,
       replyText: gen.lastModelText,
+      toolErrors: mcp.toolErrors || 0,
+      permissionPrompts: (s.stats && s.stats.permission_prompts) || 0,
     });
     mcp.seen = decision.seen || mcp.seen;
     if (decision.action === 'done') {
@@ -4144,8 +4299,23 @@ function loadSettings(store) {
   if (!Array.isArray(settings.allowedSenders) || !settings.allowedSenders.length) {
     settings.allowedSenders = [...DEFAULT_SETTINGS.allowedSenders];
   }
-  if (!['auto', 'mcp', 'paste'].includes(settings.mode)) settings.mode = 'auto';
-  for (const key of ['mcpPickupTimeoutSec', 'mcpTaskTimeoutMin']) {
+  // Legacy migration (2026-11-24): the old `mode` setting
+  // (auto/mcp/paste) maps to modeStrategy; the old
+  // mcpTaskTimeoutMin maps to mcpTimeoutMin.
+  if (store.get('modeStrategy', undefined) === undefined) {
+    const legacyMode = store.get('mode', undefined);
+    if (legacyMode === 'mcp') settings.modeStrategy = 'mcp-only';
+    else if (legacyMode === 'paste') settings.modeStrategy = 'paste-only';
+    else if (legacyMode === 'auto') settings.modeStrategy = 'mcp-first';
+  }
+  if (store.get('mcpTimeoutMin', undefined) === undefined) {
+    const n = Number(store.get('mcpTaskTimeoutMin', undefined));
+    if (Number.isFinite(n) && n > 0) settings.mcpTimeoutMin = n;
+  }
+  if (!['paste-first', 'mcp-first', 'ab', 'paste-only', 'mcp-only'].includes(settings.modeStrategy)) {
+    settings.modeStrategy = 'paste-first';
+  }
+  for (const key of ['mcpPickupTimeoutSec', 'mcpTimeoutMin']) {
     const n = Number(settings[key]);
     settings[key] = Number.isFinite(n) && n > 0 ? n : DEFAULT_SETTINGS[key];
   }
@@ -4243,12 +4413,25 @@ async function start() {
   // Show the effective value in the panel: on muse/grok/chatgpt the
   // box starts unchecked until the user turns code on explicitly.
   if (!codeEnabled) settings.codeEnabled = false;
+  // Effective code-mode strategy: an explicitly set modeStrategy
+  // wins; otherwise Gemini defaults to "ab" during the test period
+  // (testMode on), and everything else defaults to "paste-first".
+  const explicitStrategy = store.get('modeStrategy', undefined) !== undefined;
+  settings.modeStrategy = resolveModeStrategy({
+    setting: settings.modeStrategy, explicit: explicitStrategy,
+    testMode: settings.testMode, site,
+  });
   const lock = acquireLock(settings.workerId || 'default');
 
   let panel;
   // Room name while a chat item is being processed (null otherwise);
   // the mode line and heartbeat state show it.
   let activeChatRoom = null;
+  // The in-flight card's mode_stats (same object the card's stats
+  // live in, so the permission watcher can count prompts into it),
+  // plus when that card started. Null when no card is in flight.
+  let cardStats = null;
+  let cardStatsStartedAt = 0;
   // Gem mode is ON when a gemUrl is set. It can fall back to normal
   // mode for this session if the Gem does not allow model/thinking
   // selection (decided by the self-test probe at Start). Gemini only.
@@ -4263,6 +4446,11 @@ async function start() {
     return gemModeActive ? buildGemMessage(card, attempt) : buildMessage(card, attempt);
   }
 
+  /** Message for a link-flow attempt: the card's read link + instructions. */
+  function buildLinkMessage(card, attempt) {
+    return gemModeActive ? linkGemMessage(card) : linkMessage(card, attempt);
+  }
+
   /** Target for a "new chat" navigation: the Gem in Gem mode, /app otherwise. */
   function newChatTarget() {
     return gemModeActive && settings.gemUrl ? settings.gemUrl : undefined;
@@ -4274,11 +4462,19 @@ async function start() {
    * stops the worker.
    */
   async function sendHeartbeat(stateName) {
-    // While running, the heartbeat state carries the current mode,
-    // e.g. "running:mcp", "running:paste", or "running:chat:<room>".
+    // While running, the heartbeat state carries the current job,
+    // e.g. "running:card:<id>:mcp", "running:card:<id>:link", or
+    // "running:chat:<room>". Idle: the strategy's first mode.
     let name = stateName;
     if (stateName === 'running') {
-      name = activeChatRoom ? `running:chat:${activeChatRoom}` : `running:${effectiveMode().mode}`;
+      if (activeChatRoom) {
+        name = `running:chat:${activeChatRoom}`;
+      } else if (state.pending?.card) {
+        const mode = state.pending.mode === 'paste' ? 'link' : (state.pending.mode || 'link');
+        name = `running:card:${state.pending.card.id}:${mode}`;
+      } else {
+        name = `running:${displayFirstMode({ strategy: settings.modeStrategy, health: state.mcpHealth || createMcpHealth() })}`;
+      }
     }
     try {
       await client.heartbeat({
@@ -4368,16 +4564,16 @@ async function start() {
 
   /**
    * The mode the worker is currently in: the in-flight card's mode,
-   * else the mode the next card would use. pasteUntil is the end of
-   * the MCP-health paste window (0 when none).
+   * else the strategy's first mode. pasteUntil is the end of the
+   * MCP-health LINK window (0 when none).
    */
   function effectiveMode() {
     const health = state.mcpHealth || createMcpHealth();
     const now = Date.now();
     const inFlight = state.pending?.mode;
     const pasteUntil = health.pasteUntil && now < health.pasteUntil ? health.pasteUntil : 0;
-    if (inFlight) return { mode: inFlight, pasteUntil };
-    const mode = chooseMode({ modeSetting: settings.mode, health, card: { status: 'queued' }, now });
+    if (inFlight) return { mode: inFlight === 'paste' ? 'link' : inFlight, pasteUntil };
+    const mode = displayFirstMode({ strategy: settings.modeStrategy, health, now });
     return { mode, pasteUntil };
   }
 
@@ -4385,15 +4581,26 @@ async function start() {
     if (activeChatRoom) return `Mode: CHAT — ${activeChatRoom}`;
     const { mode, pasteUntil } = effectiveMode();
     if (mode === 'mcp') return 'Mode: MCP';
+    if (mode === 'ab') return 'Mode: AB (alternating)';
     if (pasteUntil) {
       const until = new Date(pasteUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      return `Mode: PASTE until ${until}`;
+      return `Mode: LINK until ${until}`;
     }
-    return 'Mode: PASTE';
+    return 'Mode: LINK';
   }
 
   function updateModeLine() {
     if (panel) panel.setMode(modeLineText());
+  }
+
+  /** Strategy + per-mode counters line for the panel. */
+  function strategyLineText() {
+    const counters = state.modeStats || createModeCounters();
+    return `Strategy: ${settings.modeStrategy} · ${formatModeCounter('MCP', counters.mcp)} · ${formatModeCounter('LINK', counters.link)}`;
+  }
+
+  function updateStrategyLine() {
+    if (panel) panel.setStrategy(strategyLineText());
   }
 
   function roomsLineText() {
@@ -4459,25 +4666,60 @@ async function start() {
     return { sent: false, reason: 'message did not appear as a user turn' };
   }
 
+  /** Mode of the in-flight card (legacy pending entries say 'paste'). */
+  function currentCardMode() {
+    const m = state.pending?.mode;
+    return m === 'paste' ? 'link' : (m || 'link');
+  }
+
+  /** Finish the in-flight card's stats at submit/fail time. */
+  function finishCardStats(ok) {
+    if (!cardStats) return;
+    cardStats.mode_used = currentCardMode();
+    cardStats.duration_s = Math.round((Date.now() - cardStatsStartedAt) / 1000);
+    cardStats.ok = ok;
+  }
+
   async function failCard(card, model, lastError) {
-    await client.setStatus(card.id, { status: 'failed', last_error: lastError, model_used: model });
+    finishCardStats(false);
+    const payload = { status: 'failed', last_error: lastError, model_used: model };
+    if (cardStats) payload.mode_stats = cardStats;
+    await client.setStatus(card.id, payload);
     state.pending = null;
     persistState(store, state);
     return 'failed';
   }
 
   async function submitCard(card, model, messages, verdict) {
-    // Re-read before submitting: an agent may have cancelled the card.
-    if (!(await checkCardActive(card))) {
+    // Never submit the same card twice: re-read the card first. An
+    // already-done card is not submitted again; a cancelled card
+    // is skipped. A backend without the card action returns null
+    // from client.card(), which means "proceed".
+    let fresh = null;
+    try {
+      fresh = await client.card(card.id);
+    } catch (err) {
+      log(`card re-read failed (${err.message}); proceeding`);
+    }
+    const decision = decideSubmit(fresh);
+    if (decision === 'already-done') {
+      log(`card #${card.seq} is already done; not submitting again`);
+      state.pending = null;
+      persistState(store, state);
+      return 'done';
+    }
+    if (decision === 'cancelled') {
+      log(`card #${card.seq} was ${fresh.status} by an agent; skipping submit`);
       state.pending = null;
       persistState(store, state);
       return 'skipped';
     }
     const content = extractFinalFile(messages, verdict.message_indexes, card.id);
     if (!content) return failCard(card, model, 'no code extracted');
-    const submitted = await client.submit(card.id, content, {
-      model_used: model, account_used: settings.workerId,
-    });
+    finishCardStats(true);
+    const extra = { model_used: model, account_used: settings.workerId };
+    if (cardStats) extra.mode_stats = cardStats;
+    const submitted = await client.submit(card.id, content, extra);
     log(`submitted card #${card.seq}: ${submitted.pr_url || submitted.commit || 'ok'}`);
     if (panel) panel.setCard(`#${card.seq} done — ${submitted.pr_url || ''}`);
     state.consecutiveGenericFailures = 0;
@@ -4502,6 +4744,9 @@ async function start() {
     if (!state.mcpHealth) state.mcpHealth = createMcpHealth();
 
     // Attempt state (persisted in pending across navigations).
+    // The card's strategy may be overridden by card.mode_hint;
+    // the first mode follows the strategy (ab alternates by seq).
+    const cardStrategy = resolveCardStrategy({ strategy: settings.modeStrategy, card });
     const s = {
       card, plan, model,
       thinking: plan.thinking,
@@ -4516,14 +4761,32 @@ async function start() {
       answerSent: resume ? Boolean(resume.answerSent) : false,
       answerContext: resume ? (resume.answerContext || '') : '',
       lastQuestion: resume ? (resume.lastQuestion || '') : '',
-      mode: resume ? (resume.mode || null) : null,
+      strategy: resume ? (resume.strategy || cardStrategy) : cardStrategy,
+      stats: resume && resume.stats ? resume.stats : createModeStats(),
+      startedAt: resume ? (resume.startedAt || Date.now()) : Date.now(),
+      mode: resume ? (resume.mode === 'paste' ? 'link' : (resume.mode || null)) : null,
       mcp: resume ? (resume.mcp || null) : null,
     };
     if (!s.mode) {
-      s.mode = chooseMode({ modeSetting: settings.mode, health: state.mcpHealth, card, now: Date.now() });
+      s.mode = firstModeForCard({ strategy: s.strategy, card, health: state.mcpHealth });
+    }
+    s.stats.mode_used = s.mode;
+    cardStats = s.stats;
+    cardStatsStartedAt = s.startedAt;
+
+    /** Fold this card's stats into the per-mode counters + panel. */
+    function finalizeCardStats(outcome) {
+      s.stats.mode_used = s.mode;
+      s.stats.duration_s = Math.round((Date.now() - s.startedAt) / 1000);
+      s.stats.ok = outcome === 'done';
+      state.modeStats = recordModeStats(state.modeStats || createModeCounters(), s.stats);
+      persistState(store, state);
+      updateStrategyLine();
+      log(`mode stats: ${JSON.stringify(s.stats)}`);
+      cardStats = null;
     }
 
-    log(`card #${card.seq} ${card.file_path} -> ${model}/${s.thinking} (${plan.reason || 'plan'}) [${s.mode}]`);
+    log(`card #${card.seq} ${card.file_path} -> ${model}/${s.thinking} (${plan.reason || 'plan'}) [${s.strategy}:${s.mode}]`);
 
     // Quota guard: below 20% only hydrogen/low may run.
     const quota = quotaDecision(state.quotaPct, plan);
@@ -4539,7 +4802,7 @@ async function start() {
     // fall back to a new chat that re-sends the original prompt.
     // Each navigation reloads the page; the stage is persisted and
     // the resume on load continues from it. Answered cards always
-    // run in paste mode (their answer is chat text).
+    // run in link mode (their answer is chat text).
     if (s.isAnswered) {
       // The card is no longer blocked — count it once, on first entry.
       if (!resume) {
@@ -4553,6 +4816,7 @@ async function start() {
           questions: s.questions, promptResent: s.promptResent,
           answerSent: s.answerSent, answerContext: s.answerContext,
           lastQuestion: s.lastQuestion, mode: s.mode, mcp: s.mcp,
+          strategy: s.strategy, stats: s.stats, startedAt: s.startedAt,
         };
         if (card.chat_url) {
           state.pending = { ...base, answeredStage: 'open-chat' };
@@ -4584,6 +4848,7 @@ async function start() {
             questions: s.questions, promptResent: s.promptResent,
             answerSent: s.answerSent, answerContext: s.answerContext,
             lastQuestion: s.lastQuestion, mode: s.mode, mcp: s.mcp,
+            strategy: s.strategy, stats: s.stats, startedAt: s.startedAt,
             answeredStage: 'fallback-ready',
           };
           persistState(store, state);
@@ -4606,6 +4871,7 @@ async function start() {
       applySettings, sendWithBounceRetry, failCard, submitCard, checkCardActive,
       fetchLinkedTexts: (urls) => fetchLinkedTexts(client, urls, log),
       buildTaskMessage,
+      buildLinkMessage,
       get panel() { return panel; },
       get gemModeActive() { return gemModeActive; },
       isRunning: () => state.running,
@@ -4629,6 +4895,7 @@ async function start() {
         promptResent: s.promptResent, answerSent: s.answerSent,
         answerContext: s.answerContext, lastQuestion: s.lastQuestion,
         mode: s.mode, mcp: s.mcp,
+        strategy: s.strategy, stats: s.stats, startedAt: s.startedAt,
       };
       if (panel) {
         panel.setCard(`#${card.seq} ${card.file_path} · ${model}/${s.thinking} · attempt ${s.attempt}/${maxAttempts} · ${s.mode.toUpperCase()}`);
@@ -4671,7 +4938,7 @@ async function start() {
 
       const result = s.mode === 'mcp'
         ? await runMcpAttempt(ctx, s)
-        : await runPasteAttempt(ctx, s);
+        : await runLinkAttempt(ctx, s);
 
       // MCP demonstrably worked (done, blocked via tools, or a
       // backend "failed" status): reset the fallback streak.
@@ -4682,25 +4949,35 @@ async function start() {
       }
       if (result.outcome === 'done' || result.outcome === 'failed' ||
           result.outcome === 'skipped' || result.outcome === 'blocked') {
+        finalizeCardStats(result.outcome);
         return result.outcome;
       }
       if (result.outcome === 'paused') return 'paused';
       if (result.outcome === 'fallback') {
         log(`MCP fallback: ${result.reason}`);
-        if (settings.mode === 'mcp') {
-          return failCard(card, model, `MCP fallback: ${result.reason}`);
+        if (!canFallback({ strategy: s.strategy, from: 'mcp' })) {
+          const outcome = await failCard(card, model, `MCP fallback: ${result.reason}`);
+          finalizeCardStats('failed');
+          return outcome;
         }
         state.mcpHealth = recordMcpFallback(state.mcpHealth, Date.now());
         persistState(store, state);
-        s.mode = 'paste';
+        s.stats.fell_back = true;
+        s.stats.fallback_reason = result.reason || '';
+        s.mode = 'link';
+        s.stats.mode_used = 'link';
+        s.stats.retries += 1;
         s.mcp = null;
         updateModeLine();
-        continue; // same card, new chat, attempt + 1, in paste mode
+        continue; // same card, new chat, attempt + 1, in link mode
       }
       // 'retry' / 'escalate': next attempt in a new chat.
+      s.stats.retries += 1;
     }
 
-    return failCard(card, model, 'max attempts reached');
+    const outcome = await failCard(card, model, 'max attempts reached');
+    finalizeCardStats('failed');
+    return outcome;
   }
 
   /** The queue loop. */
@@ -4934,6 +5211,7 @@ async function start() {
   updateRooms();
   panel.setLastChat(state.lastChatItem || '');
   updateModeLine();
+  updateStrategyLine();
   panel.setState(
     state.stoppedReason ? `Stopped: ${state.stoppedReason}` :
     !lock.held ? 'Idle — another tab is running this worker' :
@@ -4953,6 +5231,12 @@ async function start() {
     getConfig: () => ({ serverName: settings.mcpServerName, toolNames: settings.mcpToolNames }),
     isActive: () => state.running && lock.held,
     onApproved: ({ tool, serverName }) => {
+      // Count every prompt the watcher sees into the in-flight
+      // card's mode_stats (approved ones in both counters).
+      if (cardStats) {
+        cardStats.permission_prompts += 1;
+        cardStats.auto_approved += 1;
+      }
       const label = `auto-approved ${tool || 'tool'} for ${serverName}`;
       state.lastAutoApproval = label;
       persistState(store, state);
@@ -4962,6 +5246,7 @@ async function start() {
       // Only the tab holding the worker acts on prompts; the idle
       // tab never pauses or alerts for them.
       if (!lock.held) return;
+      if (cardStats) cardStats.permission_prompts += 1;
       // Never click anything. Pause the worker, show it in the
       // panel, and alert the owner (this alert is not gated on
       // alertOnStop: it is the prompt-injection guard).

@@ -69,9 +69,10 @@ Settings are stored with `GM_setValue`; nothing is hardcoded. See
    thinking options (index 0 low, 1 medium, 2 high) — the plain
    read-back cannot see the options once the menu closes. Mismatch →
    retry once → card failed with "settings mismatch".
-6. The message is the card prompt plus a footer asking Gemini to start
-   with `CARD <id>`, output exactly one file in one fenced block, and
-   end with `END-<id>` (or `CONTINUE` if it must stop early).
+6. The message depends on the mode (see "Code-mode strategy"):
+   link flow sends the card's read link (`card.read_url`) plus a
+   short instruction block; MCP sends the tool message. A card with
+   no `read_url` falls back to pasting the card text.
 7. `sent_hash = sha256(message + attempt)` is claimed first. A `409`
    means the message was already sent — the card is skipped.
 8. Insert + send. Within 10 s a new `user-query` with our text must
@@ -79,21 +80,52 @@ Settings are stored with `GM_setValue`; nothing is hardcoded. See
    symptom) send is pressed once more.
 9. Wait for completion: stop button gone **and** answer text unchanged
    for 8 s. Hard timeout 10 min. Status `waiting` while generating.
-10. The last 5 messages (thinking removed) go to `supervise`:
-    `accept` → extract + stitch + submit; `continue` → same-chat
-    "Continue…" (max 3); `retry` → new chat, resend; `escalate` →
-    one thinking level up, new chat, resend; `fail` → card failed.
-    `ask` is a first-class verdict, not an error — see below.
+10. Link flow: a cut-off answer gets up to 3 same-chat "Continue…"
+    turns, then the file is extracted from the model messages
+    (fences stripped) and submitted — after re-reading the card, so
+    an already-done card is never submitted twice. MCP mode: the
+    backend is polled every 10 s until the card is done (the tools
+    submitted it), blocked or failed.
 11. Random pace before the next message.
 
-## Two modes per card: MCP first, paste as fallback
+## Code-mode strategy
 
-Each card runs in one mode, chosen per card in `src/core/modes.js`
-(`mode` setting: `"auto"` | `"mcp"` | `"paste"`, default `"auto"`).
+Field tests show the link flow is the most reliable; MCP works well
+when it works but is slow and often needs 2–3 permission approvals
+per card. Each card runs in one mode, chosen per card in
+`src/core/modes.js` by the strategy (`modeStrategy` setting:
+`"paste-first"` (default) | `"mcp-first"` | `"ab"` |
+`"paste-only"` | `"mcp-only"`):
 
-**MCP mode (primary, `src/modes/mcp.js`).** Gemini itself works
-through the connected neon-mcp server: the script sends one message
-("Use the neon-mcp tools only. Call get_task with task_id=… … When
+- `"paste-first"` — the link flow first, MCP never (the default).
+- `"mcp-first"` — MCP first, link flow as the fallback.
+- `"ab"` — alternate per card (odd `seq` MCP-first, even `seq`
+  link-first) so both methods get comparable data.
+- `"paste-only"` / `"mcp-only"` — one mode only; a fallback in
+  `mcp-only` fails the card instead.
+- During the test period, Gemini defaults to `"ab"` when the
+  `testMode` setting is on and `modeStrategy` was never set
+  explicitly; otherwise the default is `"paste-first"`.
+- A backend card may override the strategy for that card with
+  `card.mode_hint` (one of the five values).
+- Answered cards always run in link mode: their answer is delivered
+  as chat text.
+
+**Link flow (`src/modes/link.js`).** The AI gets the card's read
+link (`card.read_url`, e.g. `read.trafactor.com/…`) plus a short
+instruction block ("Read it, then write the complete file. Reply
+with exactly one fenced code block containing the whole file, and
+end with `END-<id>`."), the script waits for the complete answer
+(thinking excluded), extracts the file content (fences stripped)
+and submits it via the backend. When the card has no `read_url`,
+the card text is pasted instead. A cut-off answer (no `END-<id>` /
+unclosed fence) gets up to 3 same-chat "Continue" turns; nothing
+extracted at all retries the card in a new chat. No supervisor in
+this flow.
+
+**MCP mode (`src/modes/mcp.js`).** Gemini itself works through the
+connected neon-mcp server: the script sends one message ("Use the
+neon-mcp tools only. Call get_task with task_id=… … When
 submit_file succeeds, reply with the PR link and DONE-…") and then
 polls the backend every 10 s with action `card`. The card carries
 `mcp_seen_at` (non-null once the tools ran), `status` and
@@ -109,37 +141,45 @@ polls the backend every 10 s with action `card`. The card carries
   "You did not finish with submit_file. Call submit_file now…",
   then keeps polling.
 
-It falls back to paste mode (same card, new chat, attempt + 1) when:
+It falls back to the link flow (same card, new chat, attempt + 1)
+when: MCP is not active for the card (`card.mcp_active === false`);
 `mcp_seen_at` is still null after `mcpPickupTimeoutSec` (default
 90 s); Gemini's reply says it has no tools / cannot reach neon-mcp /
 NOT SUPPORTED (patterns in `src/core/errors.js`, English + Persian);
-or `mcpTaskTimeoutMin` (default 25 min) passes without
-done/blocked/failed. The log says `MCP fallback: <reason>`.
+no `submit_file` within `mcpTimeoutMin` (default 6 min); more than 3
+permission prompts on one card; or an MCP tool error twice (distinct
+errors in the reply text, English + Persian). The log says
+`MCP fallback: <reason>`. Before the fallback submits, the card is
+re-read: a card that is already `done` is never submitted twice.
 
-**MCP health.** After 2 consecutive fallbacks the worker uses paste
-mode for the next 30 minutes, then tries MCP again on the next card.
-A card that demonstrably used the tools (done, blocked, or a backend
-"failed" status) resets the streak. The panel shows the current mode
-(`MCP` / `PASTE` / `PASTE until hh:mm`) and the heartbeat state
-carries it (`running:mcp`, `running:paste`).
+**MCP health.** After 2 consecutive fallbacks the worker uses the
+link flow for the next 30 minutes, then tries MCP again on the next
+card. A card that demonstrably used the tools (done, blocked, or a
+backend "failed" status) resets the streak. The panel shows the
+current mode (`MCP` / `LINK` / `LINK until hh:mm` / `AB`) and the
+heartbeat state carries the running card
+(`running:card:<id>:mcp` / `running:card:<id>:link`).
 
-`mode="mcp"` never falls back — a fallback fails the card instead.
-`mode="paste"` never tries MCP. Answered cards always run in paste
-mode: their answer is delivered as chat text.
-
-**Paste mode (`src/modes/paste.js`).** The original flow, moved here
-unchanged: send the prompt, wait, supervise, extract the code,
-submit. The permission watcher must be running in MCP mode (Always
-allow for neon-mcp tools only); a prompt that names neither our
-server nor any of our tools pauses the worker and alerts the owner.
+**Per-card stats (`mode_stats`).** Every card reports
+`{mode_used, fell_back, fallback_reason, duration_s,
+permission_prompts, auto_approved, retries, ok}` — with `submit`
+on success and with `status` on failure, and logged locally. The
+permission watcher counts every prompt it sees on the card
+(`permission_prompts`) and every auto-approval (`auto_approved`).
+The panel shows the strategy and a counter per mode: cards, ok %,
+average duration, average permission prompts. The permission
+watcher must be running in MCP mode (Always allow for neon-mcp
+tools only); a prompt that names neither our server nor any of our
+tools pauses the worker and alerts the owner.
 
 ## Questions and escalation
 
-The model is told in the footer: if anything is unclear or
-contradicts the repo, do **not** guess — output only a block starting
-with `QUESTION <id>`, list the questions, end with `END-<id>`, and
-stop. The supervisor may also return verdict `ask` with a
-`question`. Either way:
+The model is told (in the footer, and in one line of the link
+message): if anything is unclear or contradicts the repo, do **not**
+guess — output only a block starting with `QUESTION <id>`, list the
+questions, end with `END-<id>`, and stop. The link flow detects that
+block in the answer; in MCP mode a question asked via tools makes
+the card `blocked`. Either way:
 
 - The script calls `ask` with the question and the current chat URL
   (`location.href`). The card becomes `blocked` server-side; the
@@ -395,7 +435,7 @@ neon-bridge/
     chat.js               chat relay: senders filter, loop brake, split, rotation
     state.js              retry / escalation state machine
   src/modes/mcp.js        MCP mode: tool message + backend poll
-  src/modes/paste.js      paste mode: send, supervise, extract, submit
+  src/modes/link.js       link flow: read link, wait, extract, submit
   src/modes/chat.js       chat mode: summon / message / dismiss per room
   src/adapters/dom.js     shared DOM helpers + permission watcher
   src/adapters/gemini.js  everything that touches the Gemini page
@@ -426,9 +466,10 @@ never uses blocking dialogs — no `alert()`, `confirm()`, `prompt()`.
 ## Development
 
 ```bash
-node --test   # 165 unit tests (hash, extraction/stitching, errors en+fa,
+node --test   # 187 unit tests (hash, extraction/stitching, errors en+fa,
               # pacing/quiet-hours incl. overnight, state transitions,
-              # mode choice + MCP health, MCP poll decisions, nudge-once,
+              # strategy + MCP health, MCP poll decisions, nudge-once,
+              # link flow, mode_stats + double-submit guard,
               # adapter selection, chat relay + loop brake + rotation)
 node build.mjs  # rebuilds dist/neon-bridge.user.js (committed) and
                 # copies it to extension/bridge.js
