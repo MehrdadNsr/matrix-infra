@@ -6,13 +6,21 @@
   "permissions": ["storage", "scripting"],
   "host_permissions": [
     "https://gemini.google.com/*",
+    "https://grok.com/*",
+    "https://chatgpt.com/*",
+    "https://muse.ai/*",
     "https://*.supabase.co/*",
     "https://read.trafactor.com/*"
   ],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
     {
-      "matches": ["https://gemini.google.com/*"],
+      "matches": [
+        "https://gemini.google.com/*",
+        "https://grok.com/*",
+        "https://chatgpt.com/*",
+        "https://muse.ai/*"
+      ],
       "js": ["shim.js"],
       "run_at": "document_idle",
       "all_frames": false

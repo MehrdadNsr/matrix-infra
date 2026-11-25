@@ -14,7 +14,7 @@ async function seedFromLocalConfig() {
     for (const [k, v] of Object.entries(cfg || {})) {
       const key = k.startsWith("nb2-") ? k : "nb2-" + k;
       // local-config always wins for connection settings, so a key rotation on the server applies on restart
-      if (["nb2-backendUrl", "nb2-bridgeKey", "nb2-workerId"].includes(key) || all[key] === undefined) add[key] = v;
+      if (["nb2-backendUrl", "nb2-bridgeKey", "nb2-workerId", "nb2-agentName"].includes(key) || all[key] === undefined) add[key] = v;
     }
     if (Object.keys(add).length) await chrome.storage.local.set(add);
   } catch (_) { /* no local config: settings come from the panel */ }

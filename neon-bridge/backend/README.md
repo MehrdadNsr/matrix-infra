@@ -30,6 +30,10 @@ the header `x-bridge-key: <bridgeKey>`.
 | `heartbeat` | `{action:"heartbeat", worker, state, card_id?, quota_pct?, last_error?, version, last_auto_approval?}` — `state` is `running` \| `paused` \| `stopped` \| `idle`; `last_auto_approval` is e.g. `"auto-approved read_file for neon-mcp"` | `{ok}` — lets other agents see whether the bridge is alive. Sent every 60 s and on every state change. |
 | `alert` | `{action:"alert", kind:"stopped"\|"selectors"\|"account"\|"permission", message}` | `{ok}` — the backend emails the owner (rate-limited server-side). Kind `"permission"` means an unknown permission prompt appeared and was left alone; the worker paused instead of approving. The message is the prompt text, capped at 300 chars. |
 | `card` | `{action:"card", id}` | `{ok, card}` (or the card object directly). **Required in MCP mode** (the script polls it every 10 s); optional in paste mode, where it is only used before send/submit so the script can abort a card an agent cancelled (`skipped`/`failed`). If the backend does not provide this action, return `400`, `404` or `501` and the script proceeds without the re-read — but MCP mode then falls back to paste on every card. The card object should include `mcp_seen_at` (timestamp or null, set when the MCP tools first run for the card), `status` (`queued` \| `waiting` \| `done` \| `blocked` \| `failed` \| `skipped`), `result_pr_url` (set when `done`), `question` (set when `blocked` via MCP), and `last_error`. |
+| `room_poll` | `{action:"room_poll", worker, agent}` | `{ok, item \| null}` — `item`: `{id, room_id, room_name, thread_id?, chat_url?, transcript:[{sender, text, ts}], mention, members:[names], max_words?}`. `type` is `message` \| `summon` \| `dismiss`. The transcript holds room messages since this agent's last reply (max 30). The backend also filters senders (see `allowedSenders` below) and caps automatic agent-to-agent turns at 6 per human message. |
+| `room_reply` | `{action:"room_reply", id, text, chat_url}` | `{ok}` — posts the reply into the room as this agent. Long replies arrive as several calls (one per part, ≤3500 chars each), in order. |
+| `room_status` | `{action:"room_status", id, status:"working"\|"failed"\|"skipped", error?}` | `{ok}` — progress on a chat item. `skipped` covers PASS replies and loop-brake skips. |
+| `room_presence` | `{action:"room_presence", agent, room_id, state:"online"\|"offline"}` | `{ok}` — presence for a room. |
 | `alert` | `{action:"alert", kind:"stopped"\|"selectors"\|"account", message}` | `{ok}` — the backend emails the owner (rate-limited server-side). The script calls this only when it fully stops. |
 
 ### Card object (`next`)
@@ -64,6 +68,34 @@ Notes:
   `ask` is a first-class verdict, not an error.
 - `message_indexes` in a verdict refer to the `messages` array sent
   in that same `supervise` call, in order.
+### Chat item object (`room_poll`)
+
+```json
+{
+  "id": "chat-uuid",
+  "type": "message",
+  "room_id": "room-uuid",
+  "room_name": "core-team",
+  "thread_id": "thread-uuid",
+  "chat_url": "https://gemini.google.com/app/c/abc123",
+  "transcript": [{ "sender": "mehrdad", "text": "review the PR", "ts": 1730000000 }],
+  "mention": true,
+  "members": ["mehrdad", "oracle", "neon"],
+  "max_words": 150
+}
+```
+
+Notes:
+
+- `chat_url` is the dedicated chat this agent uses for the room (if
+  any). When it is absent, or it no longer loads, the script starts a
+  new chat, sends the intro prompt + a 5-line summary of the
+  transcript, then relays. After a rotation the script reports the
+  new chat URL with the next `room_reply`.
+- `allowedSenders` (default: mehrdad, oracle, claude, morpheus,
+  neon, muse, grok, gpt) is enforced on both sides. Only mehrdad /
+  oracle may authorize tool actions that write; the script adds a
+  guard line to the relay when anyone else spoke.
 - `complete` says whether the answer is a complete file;
   `needs_stitch` says its parts (across the indexed messages) must be
   joined; `stale` says the model echoed a stale/old answer.

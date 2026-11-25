@@ -1,11 +1,19 @@
 # Neon Bridge v2
 
-A Tampermonkey userscript that works through a queue of coding task
-cards on [Gemini](https://gemini.google.com). For each card it picks
-the model and thinking level, sends the prompt to Gemini (model
-"Neon 4"), collects the answer, gets a verdict from a supervisor, and
-submits the final file to a backend. The backend commits the file to a
-branch and opens a PR. **The script never touches GitHub directly.**
+One script, three jobs: code mode via MCP or copy-paste, and
+group-chat relay — on [Gemini](https://gemini.google.com),
+[Muse](https://muse.ai), [Grok](https://grok.com) and
+[ChatGPT](https://chatgpt.com), one tab each, one shared core and one
+adapter per site.
+
+For a coding task card it picks the model and thinking level, sends
+the prompt to the AI (Gemini model "Neon"), collects the answer, gets
+a verdict from a supervisor, and submits the final file to a backend.
+The backend commits the file to a branch and opens a PR. **The script
+never touches GitHub directly.** In chat mode the AI on the tab takes
+part in a group chat room (Matrix behind the backend): the script
+relays room messages into the room's dedicated chat and posts the
+AI's reply back into the room.
 
 Single-account safety is the point: one worker per browser, quiet
 hours, random pacing, a soft daily cap, and a full stop (with an owner
@@ -194,13 +202,96 @@ patterns, so the script stays a plain user of the web UI:
   across 4 phrasings by attempt number, and the `sent_hash` includes
   the attempt number.
 
+## Adapters (one script, several sites)
+
+One tab = one worker, one site. The adapter is picked by
+`location.hostname` (`src/adapters/index.js`): `gemini.google.com`
+→ Gemini, `muse.ai` (setting `museDomain`, default `muse.ai`) →
+Muse, `grok.com` → Grok, `chatgpt.com` → ChatGPT. Every adapter
+exposes the same interface — `selfTest()`, `newChat()`,
+`openChat(url)`, `currentChatUrl()`, `send(text)`,
+`waitForReply()`, `readLastReply()`, `detectErrors()`,
+`detectLimits()`, plus `healthCheck()` / `isGenerating()` and
+optional `setModel` / `setThinking` (no-ops where a site has none).
+Shared DOM helpers live in `src/adapters/dom.js` (send fallbacks,
+reply waiting, the permission watcher), so a fix there applies to
+all four sites.
+
+The Gemini adapter is verified on the live page. The Muse, Grok and
+ChatGPT adapters are **unverified best guesses**: each one's
+selectors live in its own section of `src/selectors.js`, marked
+`[unverified]`, and `selfTest()` reports exactly which keys are
+missing. On a failed self-test the tab runs in a "disabled" state
+(heartbeat state `disabled` + owner alert kind `selectors`) — never
+guess silently. Changing `museDomain` also needs the userscript
+`@match` / extension manifest updated to run on the new domain.
+
+## Chat mode (group-chat relay)
+
+In chat mode the AI on the tab takes part in a group chat room
+(Matrix behind the backend). The backend offers items via
+`{action:"room_poll", worker, agent}` — type `message` | `summon` |
+`dismiss`, with the room's transcript (max 30 lines since this
+agent's last reply), `mention`, `members` and `max_words`
+(default 150):
+
+- **summon:** open (or create) the room's dedicated chat, send the
+  intro prompt (built in `src/core/message.js`), then `room_reply`
+  a short "online" line and `room_presence` online.
+- **message:** open the room's chat (`chat_url`; if it does not
+  load, new chat + intro prompt + a 5-line summary of the
+  transcript), send the relay message ("New messages in
+  `<room_name>` since your last reply: …" + the transcript lines +
+  "You were addressed. Reply as …" or "Reply only if you have
+  something useful; otherwise reply exactly PASS."), wait for the
+  full reply (thinking excluded), trim it. Exactly `PASS` →
+  `room_status` skipped; otherwise `room_reply` (replies over 3500
+  chars split into parts).
+- **dismiss:** `room_presence` offline, forget the room's chat,
+  back to normal work.
+
+**Scheduling.** Chat items have priority over code cards, but never
+interrupt a card while the AI is generating: `room_poll` runs
+between cards and every 20 s while idle. Pacing, quiet hours, the
+daily soft cap and the quota guard apply to chat too; chat messages
+pace shorter (random 5–20 s) but still count toward the cap.
+`codeEnabled` / `chatEnabled` (both default true on Gemini; on
+Muse/Grok/ChatGPT `codeEnabled` defaults to false until their code
+flows exist — turning it on in the panel makes it stick).
+
+**Long-chat hygiene.** After more than 40 relayed turns in a room's
+chat, the script asks the AI for a 10-line summary, starts a new
+chat, sends the intro prompt + summary, and stores the new
+`chat_url`.
+
+**Safety.** `allowedSenders` (default: mehrdad, oracle, claude,
+morpheus, neon, muse, grok, gpt) filters the transcript — lines from
+anyone else are dropped before relaying, and the backend filters
+too. Only mehrdad / oracle may authorize tool actions that write
+(`submit_file` etc.): when a relayed transcript has lines from
+anyone else, the relay message carries a guard line saying so.
+Loop brake: at most 6 chat replies per room per 10 minutes without
+a human message (mehrdad / oracle) in between — the backend caps
+automatic agent-to-agent turns at 6 per human message as well. On a
+brake, the item is logged and `room_status` skipped. Never paste
+secrets into a chat. The permission watcher runs on every site
+(Always allow only for our neon-mcp tools).
+
+**Panel + heartbeat.** The panel shows site/adapter, agent name,
+mode (MCP / PASTE / CHAT), rooms joined, and the last chat item;
+heartbeat state is `running:chat:<room_name>` while a chat item is
+being processed. A "Leave all rooms" button sends `room_presence`
+offline for each room.
+
 ## Heartbeat and remote visibility
 
 Other agents can see whether the bridge is alive: the script sends
 `{action:"heartbeat", worker, state, card_id?, quota_pct?,
 last_error?, version}` every 60 s and on every state change
 (started, paused, card finished, stopped). A failed heartbeat never
-stops the worker.
+stops the worker. While a chat item is being processed the state is
+`running:chat:<room_name>`; a disabled tab (failed self-test)
+reports `disabled`.
 
 Before sending a message and before submitting, the script re-reads
 the card (`{action:"card", id}` when the backend provides it). If an
@@ -222,9 +313,10 @@ Set `gemUrl` in the panel to a Gemini Gem URL to turn Gem mode on:
 
 ## Auto-approve tool permission prompts (neon-mcp only)
 
-The Gemini app may show a permission prompt before a connected MCP
+Any of the sites may show a permission prompt before a connected MCP
 tool runs ("Allow" / "Always allow", or in Persian «اجازه دادن» /
-«همیشه اجازه داده شود»). The watcher in `src/adapters/gemini.js`
+«همیشه اجازه داده شود»). The watcher in `src/adapters/dom.js` (one
+implementation, used by every adapter)
 (MutationObserver + a 2 s fallback poll) handles it:
 
 - **Approve, only when the prompt is clearly ours:** the dialog or
@@ -300,10 +392,17 @@ neon-bridge/
     message.js            prompt footer, continue message
     permission.js         permission-prompt classification (neon-mcp only)
     modes.js              per-card mode choice + MCP health
+    chat.js               chat relay: senders filter, loop brake, split, rotation
     state.js              retry / escalation state machine
   src/modes/mcp.js        MCP mode: tool message + backend poll
   src/modes/paste.js      paste mode: send, supervise, extract, submit
+  src/modes/chat.js       chat mode: summon / message / dismiss per room
+  src/adapters/dom.js     shared DOM helpers + permission watcher
   src/adapters/gemini.js  everything that touches the Gemini page
+  src/adapters/muse.js    Muse web app (selectors unverified)
+  src/adapters/grok.js    grok.com (selectors unverified)
+  src/adapters/chatgpt.js chatgpt.com (selectors unverified)
+  src/adapters/index.js   adapter selection by hostname
   src/backend/client.js   all HTTP calls (GM_xmlhttpRequest)
   src/ui/panel.js         floating control panel (nb2- prefixed)
   src/main.js             queue loop wiring it all together
@@ -315,10 +414,10 @@ neon-bridge/
   config.example.json     every setting with its default
 ```
 
-**Adapters:** all Gemini page access lives in
-`src/adapters/gemini.js` behind one interface (health check, model /
-thinking pickers, send, read answers, quota). An AI Studio or
-ChatGPT adapter implements the same interface; core never changes.
+**Adapters:** all page access lives in `src/adapters/*.js` behind
+one interface (health check, model / thinking pickers, send, read
+answers, quota). A new site adds one adapter file and one
+`selectSite` branch; core never changes.
 
 **Panel:** prefixed `nb2-` throughout, top-right, collapsible, so it
 never collides with the v1 "Trafactor Bridge - Gemini" panel. It
@@ -327,9 +426,10 @@ never uses blocking dialogs — no `alert()`, `confirm()`, `prompt()`.
 ## Development
 
 ```bash
-node --test   # 131 unit tests (hash, extraction/stitching, errors en+fa,
+node --test   # 165 unit tests (hash, extraction/stitching, errors en+fa,
               # pacing/quiet-hours incl. overnight, state transitions,
-              # mode choice + MCP health, MCP poll decisions, nudge-once)
+              # mode choice + MCP health, MCP poll decisions, nudge-once,
+              # adapter selection, chat relay + loop brake + rotation)
 node build.mjs  # rebuilds dist/neon-bridge.user.js (committed) and
                 # copies it to extension/bridge.js
 ```
@@ -363,6 +463,21 @@ Gemini, run the panel's **Self-test**, and compare):
       content from collected answers.
 - [ ] Whether assigning the same `/app` URL (or the reload fallback
       in the adapter) reliably opens a fresh chat every time.
+- [ ] **Muse web app (muse.ai) — all selectors unverified:**
+      editor, send button, user/assistant turns, stop button, busy
+      indicators, error toast. The DOM is unknown; these are generic
+      guesses (`[contenteditable]`, `textarea`, `button[aria-label*=
+      "Send"]`, `[data-message-author-role]`).
+- [ ] **Grok (grok.com) — all selectors unverified:** editor
+      (`textarea[placeholder*="Ask Grok"]`), send button, user/
+      assistant turns (`[data-testid="user-message"]` /
+      `[data-testid="assistant-message"]`), stop button, busy
+      indicators, error toast.
+- [ ] **ChatGPT (chatgpt.com) — all selectors unverified:** editor
+      (`#prompt-textarea`), send (`button[data-testid="send-button"]`),
+      user/assistant turns (`div[data-message-author-role]`), stop
+      (`button[data-testid="stop-button"]`), busy indicators, error
+      toast.
 
 ## Open questions
 
