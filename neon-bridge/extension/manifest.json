@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Neon Bridge v2",
-  "version": "0.1.0",
-  "description": "Runs the Neon Bridge userscript (dist/neon-bridge.user.js) as an extension, so a headless server Chrome needs no Tampermonkey.",
+  "version": "0.1.1",
+  "description": "Runs the Neon Bridge userscript (dist/neon-bridge.user.js) as an extension, so a headless server Chrome needs no Tampermonkey. Also carries the Muse auto-allow script.",
   "permissions": ["storage", "scripting"],
   "host_permissions": [
     "https://gemini.google.com/*",
@@ -18,10 +18,18 @@
       "matches": [
         "https://gemini.google.com/*",
         "https://grok.com/*",
-        "https://chatgpt.com/*",
-        "https://muse.ai/*"
+        "https://chatgpt.com/*"
       ],
       "js": ["shim.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://muse.ai/*",
+        "https://www.muse.ai/*"
+      ],
+      "js": ["muse-allow.js"],
       "run_at": "document_idle",
       "all_frames": false
     }
