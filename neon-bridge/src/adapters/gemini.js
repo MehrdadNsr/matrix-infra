@@ -29,7 +29,7 @@ import {
   firstMatch,
   firstMatches,
   insertIntoEditor,
-  pageErrorText as domPageErrorText,
+  domPageErrorText,
   pressEnterKey,
   sendViaSelectors,
   startPermissionWatcher as startWatcher,
