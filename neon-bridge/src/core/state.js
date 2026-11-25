@@ -175,6 +175,10 @@ export function createWorkerState() {
     latestQuestion: '', // text of the most recent routed question
     lastAutoApproval: null, // e.g. "auto-approved read_file for neon-mcp"
     mcpHealth: { consecutiveFallbacks: 0, pasteUntil: 0 }, // MCP fallback streak + paste window (ms epoch)
+    modeStats: { // per-mode counters: { mcp: {cards, ok, totalDurationS, permissionPrompts}, link: {...} }
+      mcp: { cards: 0, ok: 0, totalDurationS: 0, permissionPrompts: 0 },
+      link: { cards: 0, ok: 0, totalDurationS: 0, permissionPrompts: 0 },
+    },
     rooms: {}, // chat rooms joined: { [roomId]: { roomId, roomName, chatUrl, turns, replyTimes, lastHumanTs } }
     pendingChat: null, // in-flight chat item, saved before navigation: { item, stage, expectedUrl?, summary? }
     lastChatItem: '', // one-line summary of the last chat item, shown in the panel

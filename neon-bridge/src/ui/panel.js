@@ -11,9 +11,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   gemUrl: '', // optional: when set, Gem mode is ON (default OFF)
   mcpServerName: 'neon-mcp',
   mcpToolNames: ['repo_info', 'list_dir', 'read_file', 'get_task', 'submit_file', 'ask_question', 'report_status'],
-  mode: 'auto', // "auto" | "mcp" | "paste": which mode runs a card
+  modeStrategy: 'paste-first', // "paste-first" | "mcp-first" | "ab" | "paste-only" | "mcp-only": which code mode runs first
+  testMode: false, // when on, Gemini defaults to "ab" unless modeStrategy was set explicitly
   mcpPickupTimeoutSec: 90, // MCP: give up if no tool use seen in this long
-  mcpTaskTimeoutMin: 25, // MCP: give up if the task is not done in this long
+  mcpTimeoutMin: 6, // MCP: fall back to the link flow if no submit_file in this long
   agentName: '', // agent id for this tab; '' = the site default (gemini neon, muse muse, grok grok, chatgpt gpt)
   museDomain: 'muse.ai', // the Muse web app's domain (also needs @match / manifest to run there)
   codeEnabled: true, // code cards (MCP/paste); default false on muse/grok/gpt until their code flows exist
@@ -98,9 +99,13 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest, onL
   quotaLine.id = 'nb2-quota';
   body.appendChild(quotaLine);
 
-  const modeLine = el('div', 'nb2-small', 'Mode: MCP');
+  const modeLine = el('div', 'nb2-small', 'Mode: LINK');
   modeLine.id = 'nb2-mode';
   body.appendChild(modeLine);
+
+  const strategyLine = el('div', 'nb2-small', 'Strategy: paste-first');
+  strategyLine.id = 'nb2-strategy';
+  body.appendChild(strategyLine);
 
   const blockedLine = el('div', 'nb2-small', 'Blocked (waiting for answer): 0');
   blockedLine.id = 'nb2-blocked';
@@ -156,9 +161,9 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest, onL
     ['gemUrl', 'Gem URL (optional, Gem mode)', 'text'],
     ['mcpServerName', 'MCP server name (auto-approve)', 'text'],
     ['mcpToolNames', 'MCP tool names (comma-separated)', 'list'],
-    ['mode', 'Mode (auto / mcp / paste)', 'select', ['auto', 'mcp', 'paste']],
+    ['modeStrategy', 'Strategy (paste-first / mcp-first / ab / paste-only / mcp-only)', 'select', ['paste-first', 'mcp-first', 'ab', 'paste-only', 'mcp-only']],
     ['mcpPickupTimeoutSec', 'MCP pickup timeout (sec)', 'number'],
-    ['mcpTaskTimeoutMin', 'MCP task timeout (min)', 'number'],
+    ['mcpTimeoutMin', 'MCP timeout (min, then link fallback)', 'number'],
     ['agentName', 'Agent name (empty = site default)', 'text'],
     ['museDomain', 'Muse web app domain', 'text'],
     ['allowedSenders', 'Allowed senders (comma-separated)', 'list'],
@@ -219,7 +224,19 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest, onL
   quietLabel.appendChild(quietRow);
   form.appendChild(quietLabel);
 
-  const codeLabel = el('label', '', 'Code cards (MCP / paste)');
+  const testLabel = el('label', '', 'Test mode (Gemini defaults to "ab" strategy)');
+  const testCheck = el('input');
+  testCheck.id = 'nb2-set-testMode';
+  testCheck.type = 'checkbox';
+  testCheck.checked = Boolean(settings.testMode);
+  testCheck.addEventListener('change', () => {
+    settings.testMode = testCheck.checked;
+    store.set('testMode', testCheck.checked);
+  });
+  testLabel.prepend(testCheck);
+  form.appendChild(testLabel);
+
+  const codeLabel = el('label', '', 'Code cards (MCP / link)');
   const codeCheck = el('input');
   codeCheck.id = 'nb2-set-codeEnabled';
   codeCheck.type = 'checkbox';
@@ -304,6 +321,9 @@ export function createPanel({ store, settings, onStart, onPause, onSelfTest, onL
     },
     setMode(text) {
       modeLine.textContent = text;
+    },
+    setStrategy(text) {
+      strategyLine.textContent = text;
     },
     setQuota(pct) {
       quotaLine.textContent = pct == null ? 'Quota: unknown' : `Quota remaining: ${pct}%`;

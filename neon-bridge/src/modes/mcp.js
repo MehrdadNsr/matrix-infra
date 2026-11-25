@@ -1,13 +1,16 @@
 // MCP mode — Gemini works through the neon-mcp tools and delivers
 // the file with submit_file; the script polls the backend until the
-// card is done, blocked or failed, and only falls back to paste mode
-// on a pickup timeout, a "no tools" reply, or a task timeout.
+// card is done, blocked or failed, and only falls back to the link
+// flow on a pickup timeout, a "no tools" reply, a task timeout, MCP
+// not being active, more than 3 permission prompts on one card, or
+// an MCP tool error twice.
 //
 // The poll decision (mcpPollDecision) is pure and unit-tested; the
 // wiring below (send + poll loop) is thin. `ctx` and `s` are the same
-// shapes paste.js uses (see its header). `s.mcp` is
-// { startedAt, nudged, seen, sent, lastText, lastTextAt } — persisted
-// in pending so a reload resumes polling instead of re-sending.
+// shapes link.js uses (see its header). `s.mcp` is
+// { startedAt, nudged, seen, sent, lastText, lastTextAt, toolErrors,
+//   lastToolError } — persisted in pending so a reload resumes
+// polling instead of re-sending.
 
 import { sentHash } from '../core/hash.js';
 import { classifyError } from '../core/errors.js';
@@ -16,6 +19,25 @@ import { mcpMessage, mcpNudgeMessage } from '../core/message.js';
 
 export const MCP_POLL_MS = 10000;
 const REPLY_STABLE_MS = 8000; // reply text unchanged this long = finished
+export const MCP_MAX_PERMISSION_PROMPTS = 3; // more than this on one card -> fallback
+export const MCP_MAX_TOOL_ERRORS = 2; // this many distinct tool errors -> fallback
+
+/**
+ * True when the reply text reports an MCP tool error (the tool call
+ * itself failed, e.g. submit_file / get_task errored). English and
+ * Persian. Used to count distinct tool errors across the attempt.
+ */
+export function detectMcpToolError(text) {
+  const t = String(text || '');
+  if (!t) return false;
+  return (
+    /(submit_file|get_task|read_file|list_dir|repo_info|ask_question|report_status)\s+(failed|error|errored)/i.test(t) ||
+    /tool\s+(error|failed)/i.test(t) ||
+    /mcp\s+(tool\s+)?(error|failed)/i.test(t) ||
+    /خطا(ی)?\s*(ابزار|mcp)/.test(t) ||
+    /(ابزار|mcp)\s*.*خطا/.test(t)
+  );
+}
 
 /**
  * Pure poll decision. Input:
@@ -26,12 +48,14 @@ const REPLY_STABLE_MS = 8000; // reply text unchanged this long = finished
  *  elapsedMs, pickupTimeoutMs, taskTimeoutMs
  *  replyFinished: the reply ended (stop button gone, text stable)
  *  replyText: the last model turn, thinking removed
+ *  toolErrors: distinct MCP tool errors seen so far on this card
+ *  permissionPrompts: permission prompts the watcher saw on this card
  * Returns { action, reason?, prUrl?, question?, seen } where action
  * is 'done' | 'blocked' | 'failed' | 'fallback' | 'nudge' | 'wait'.
  */
 export function mcpPollDecision({
   card, seen, nudged, elapsedMs, pickupTimeoutMs, taskTimeoutMs,
-  replyFinished, replyText,
+  replyFinished, replyText, toolErrors = 0, permissionPrompts = 0,
 }) {
   if (!card) return { action: 'fallback', reason: 'backend does not provide card action', seen };
   if (card.status === 'done') {
@@ -48,11 +72,22 @@ export function mcpPollDecision({
     return { action: 'failed', reason: card.last_error || 'MCP task failed', seen: seen || Boolean(card.mcp_seen_at) };
   }
   const seenNow = seen || Boolean(card.mcp_seen_at);
+  // MCP not active on this card (the backend says so): fall back
+  // immediately instead of waiting for a pickup that will not come.
+  if (card.mcp_active === false) {
+    return { action: 'fallback', reason: 'MCP is not active for this card', seen: seenNow };
+  }
   // A "no tools" reply is recognised immediately — no point waiting
   // for the pickup timeout when Gemini already said it cannot use
   // the tools.
   if (replyText && classifyError(replyText).kind === 'no_mcp_tools') {
     return { action: 'fallback', reason: 'Gemini reports no MCP tools', seen: seenNow };
+  }
+  if (toolErrors >= MCP_MAX_TOOL_ERRORS) {
+    return { action: 'fallback', reason: `MCP tool error ${toolErrors} times`, seen: seenNow };
+  }
+  if (permissionPrompts > MCP_MAX_PERMISSION_PROMPTS) {
+    return { action: 'fallback', reason: `more than ${MCP_MAX_PERMISSION_PROMPTS} permission prompts on one card`, seen: seenNow };
   }
   if (!seenNow && elapsedMs > pickupTimeoutMs) {
     return { action: 'fallback', reason: `no MCP pickup in ${Math.round(pickupTimeoutMs / 1000)}s`, seen: seenNow };
@@ -80,7 +115,7 @@ export async function runMcpAttempt(ctx, s) {
   const settings = ctx.settings;
   const mcp = s.mcp || (s.mcp = {
     startedAt: Date.now(), nudged: false, seen: false, sent: false,
-    lastText: '', lastTextAt: 0,
+    lastText: '', lastTextAt: 0, toolErrors: 0, lastToolError: '',
   });
 
   if (!mcp.sent) {
@@ -151,15 +186,25 @@ export async function runMcpAttempt(ctx, s) {
       mcp.lastText = gen.lastModelText;
       mcp.lastTextAt = Date.now();
     }
+    // Distinct MCP tool errors in the reply text: count a new one
+    // only when the text changed, so one persistent error is not
+    // counted on every poll.
+    if (gen.lastModelText && detectMcpToolError(gen.lastModelText) &&
+        gen.lastModelText !== mcp.lastToolError) {
+      mcp.toolErrors = (mcp.toolErrors || 0) + 1;
+      mcp.lastToolError = gen.lastModelText;
+    }
     const decision = mcpPollDecision({
       card: fresh,
       seen: mcp.seen,
       nudged: mcp.nudged,
       elapsedMs: Date.now() - mcp.startedAt,
       pickupTimeoutMs: settings.mcpPickupTimeoutSec * 1000,
-      taskTimeoutMs: settings.mcpTaskTimeoutMin * 60 * 1000,
+      taskTimeoutMs: (settings.mcpTimeoutMin || 6) * 60 * 1000,
       replyFinished,
       replyText: gen.lastModelText,
+      toolErrors: mcp.toolErrors || 0,
+      permissionPrompts: (s.stats && s.stats.permission_prompts) || 0,
     });
     mcp.seen = decision.seen || mcp.seen;
     if (decision.action === 'done') {

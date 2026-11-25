@@ -165,3 +165,28 @@ export function roomIntroWithSummary({ agentDisplayName, roomName, members = [],
     `Summary of the previous chat for this room:\n${summary}`
   );
 }
+
+/* --- Link flow (paste mode) --- */
+
+/**
+ * Message for the link flow: the card's read link plus a short
+ * instruction block. When the card has no read_url, fall back to
+ * pasting the card text (the full prompt + footer).
+ */
+export function linkMessage(card, attempt = 1) {
+  if (card.read_url) {
+    return (
+      `${introForAttempt(attempt)}\n\n` +
+      `Read the task here: ${card.read_url}\n\n` +
+      `Read it, then write the complete file. Reply with exactly one fenced code block containing the whole file, and end with END-${card.id}.\n` +
+      `If anything in the task is unclear or contradicts the repo, do NOT guess — output only a block starting with the line QUESTION ${card.id}, list the questions, end with END-${card.id}, and stop.`
+    );
+  }
+  return buildMessage(card, attempt);
+}
+
+/** Gem mode variant of the link message: CARD + link + one-line reminder. */
+export function linkGemMessage(card) {
+  const body = card.read_url ? `Read the task here: ${card.read_url}` : card.prompt;
+  return `CARD ${card.id}\n${body}\nFollow your rules. End with END-${card.id}.`;
+}

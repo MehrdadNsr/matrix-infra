@@ -37,7 +37,7 @@ const FILES = [
   'src/adapters/chatgpt.js',
   'src/adapters/index.js',
   'src/ui/panel.js',
-  'src/modes/paste.js',
+  'src/modes/link.js',
   'src/modes/mcp.js',
   'src/modes/chat.js',
   'src/main.js',
